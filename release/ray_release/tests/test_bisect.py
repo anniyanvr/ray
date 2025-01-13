@@ -1,16 +1,18 @@
 import sys
 import pytest
 from unittest import mock
-from typing import List, Set, Dict
+from typing import List, Dict
 
-from ray_release.scripts.ray_bisect import _bisect, _obtain_test_result, _sanity_check
-from ray_release.config import Test
+from ray_release.scripts.ray_bisect import (
+    _bisect,
+    _obtain_test_result,
+    _sanity_check,
+    _get_test,
+)
 
 
 def test_sanity_check():
-    def _mock_run_test(
-        test: Test, commit: Set[str], run_per_commit: int
-    ) -> Dict[str, Dict[int, str]]:
+    def _mock_run_test(*args, **kwawrgs) -> Dict[str, Dict[int, str]]:
         return {
             "passing_revision": {0: "passed", 1: "passed"},
             "failing_revision": {0: "failed", 1: "failed"},
@@ -54,6 +56,13 @@ def test_obtain_test_result():
             _obtain_test_result(commits, rerun_per_commit) == test_case
 
 
+def test_get_test():
+    test = _get_test(
+        "test_name", ["release/ray_release/tests/test_collection_data.yaml"]
+    )
+    assert test.get_name() == "test_name"
+
+
 def test_bisect():
     test_cases = {
         "c3": {
@@ -81,14 +90,15 @@ def test_bisect():
 
     for output, input in test_cases.items():
 
-        def _mock_run_test(
-            test: Test, commit: List[str], rerun_per_commit
-        ) -> Dict[str, str]:
-            return input
+        def _side_effect(ret):
+            def _mock_run_test(*args, **kwawrgs) -> Dict[str, str]:
+                return ret
+
+            return _mock_run_test
 
         with mock.patch(
             "ray_release.scripts.ray_bisect._run_test",
-            side_effect=_mock_run_test,
+            side_effect=_side_effect(input),
         ):
             for concurreny in range(1, 4):
                 assert _bisect({}, list(input.keys()), concurreny, 1) == output

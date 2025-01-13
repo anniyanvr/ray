@@ -4,7 +4,7 @@ import traceback
 from typing import Optional, List, Tuple
 
 from ray_release.alerts.handle import handle_result, require_result
-from ray_release.anyscale_util import get_cluster_name
+from ray_release.anyscale_util import get_cluster_name, LAST_LOGS_LENGTH
 from ray_release.buildkite.output import buildkite_group, buildkite_open_last
 from ray_release.cluster_manager.cluster_manager import ClusterManager
 from ray_release.cluster_manager.full import FullClusterManager
@@ -12,17 +12,16 @@ from ray_release.cluster_manager.minimal import MinimalClusterManager
 from ray_release.command_runner.job_runner import JobRunner
 from ray_release.command_runner.command_runner import CommandRunner
 from ray_release.command_runner.anyscale_job_runner import AnyscaleJobRunner
+from ray_release.test import Test
 from ray_release.config import (
-    Test,
     DEFAULT_BUILD_TIMEOUT,
     DEFAULT_CLUSTER_TIMEOUT,
     DEFAULT_COMMAND_TIMEOUT,
     DEFAULT_WAIT_FOR_NODES_TIMEOUT,
     RELEASE_PACKAGE_DIR,
     DEFAULT_AUTOSUSPEND_MINS,
-    validate_test,
 )
-from ray_release.template import load_test_cluster_env, load_test_cluster_compute
+from ray_release.template import load_test_cluster_compute
 from ray_release.exception import (
     ReleaseTestConfigError,
     ReleaseTestSetupError,
@@ -32,22 +31,16 @@ from ray_release.exception import (
     PrepareCommandTimeout,
     TestCommandError,
     TestCommandTimeout,
-    LocalEnvSetupError,
     ClusterEnvCreateError,
 )
 from ray_release.file_manager.job_file_manager import JobFileManager
 from ray_release.logger import logger
 from ray_release.reporter.reporter import Reporter
-from ray_release.result import Result, handle_exception
+from ray_release.result import Result, ResultStatus, handle_exception
 from ray_release.signal_handling import (
     setup_signal_handling,
     reset_signal_handling,
     register_handler,
-)
-from ray_release.util import (
-    run_bash_script,
-    get_pip_packages,
-    reinstall_anyscale_dependencies,
 )
 
 type_str_to_command_runner = {
@@ -79,15 +72,14 @@ def _load_test_configuration(
     test: Test,
     anyscale_project: str,
     result: Result,
-    ray_wheels_url: str,
     smoke_test: bool = False,
     no_terminate: bool = False,
+    test_definition_root: Optional[str] = None,
+    log_streaming_limit: int = LAST_LOGS_LENGTH,
 ) -> Tuple[ClusterManager, CommandRunner, str]:
-    validate_test(test)
     logger.info(f"Test config: {test}")
 
     # Populate result paramaters
-    result.wheels_url = ray_wheels_url
     result.stable = test.get("stable", True)
     result.smoke_test = smoke_test
     buildkite_url = os.getenv("BUILDKITE_BUILD_URL", "")
@@ -99,7 +91,7 @@ def _load_test_configuration(
 
     # Setting up working directory
     working_dir = test["working_dir"]
-    new_wd = os.path.join(RELEASE_PACKAGE_DIR, working_dir)
+    new_wd = os.path.join(test_definition_root or RELEASE_PACKAGE_DIR, working_dir)
     os.chdir(new_wd)
 
     run_type = test["run"].get("type", DEFAULT_RUN_TYPE)
@@ -135,9 +127,10 @@ def _load_test_configuration(
     # Instantiate managers and command runner
     try:
         cluster_manager = cluster_manager_cls(
-            test["name"],
+            test,
             anyscale_project,
             smoke_test=smoke_test,
+            log_streaming_limit=log_streaming_limit,
         )
         command_runner = command_runner_cls(
             cluster_manager,
@@ -155,13 +148,12 @@ def _setup_cluster_environment(
     test: Test,
     result: Result,
     cluster_manager: ClusterManager,
-    ray_wheels_url: str,
     cluster_env_id: Optional[str],
+    test_definition_root: Optional[str] = None,
 ) -> Tuple[str, int, int, int, int]:
     setup_signal_handling()
     # Load configs
-    cluster_env = load_test_cluster_env(test, ray_wheels_url=ray_wheels_url)
-    cluster_compute = load_test_cluster_compute(test)
+    cluster_compute = load_test_cluster_compute(test, test_definition_root)
 
     if cluster_env_id:
         try:
@@ -179,7 +171,7 @@ def _setup_cluster_environment(
                 f"{cluster_env_id}: {e}"
             ) from e
     else:
-        cluster_manager.set_cluster_env(cluster_env)
+        cluster_manager.set_cluster_env()
 
     # Load some timeouts
     build_timeout = int(test["run"].get("build_timeout", DEFAULT_BUILD_TIMEOUT))
@@ -235,26 +227,6 @@ def _setup_cluster_environment(
     return prepare_cmd, prepare_timeout, build_timeout, cluster_timeout, command_timeout
 
 
-def _setup_local_environment(
-    test: Test,
-    command_runner: CommandRunner,
-    ray_wheels_url: str,
-) -> None:
-    driver_setup_script = test.get("driver_setup", None)
-    if driver_setup_script:
-        try:
-            run_bash_script(driver_setup_script)
-        except Exception as e:
-            raise LocalEnvSetupError(f"Driver setup script failed: {e}") from e
-
-    # Install local dependencies
-    command_runner.prepare_local_env(ray_wheels_url)
-
-    # Re-install anyscale package as local dependencies might have changed
-    # from local env setup
-    reinstall_anyscale_dependencies()
-
-
 def _local_environment_information(
     result: Result,
     cluster_manager: ClusterManager,
@@ -265,10 +237,6 @@ def _local_environment_information(
     cluster_id: Optional[str],
     cluster_env_id: Optional[str],
 ) -> None:
-    pip_packages = get_pip_packages()
-    pip_package_string = "\n".join(pip_packages)
-    logger.info(f"Installed python packages:\n{pip_package_string}")
-
     if isinstance(cluster_manager, FullClusterManager):
         if not no_terminate:
             register_handler(
@@ -334,7 +302,7 @@ def _running_test_script(
     command_timeout: int,
 ) -> None:
     command = test["run"]["script"]
-    command_env = {}
+    command_env = test.get_byod_runtime_env()
 
     if smoke_test:
         command = f"{command} --smoke-test"
@@ -348,6 +316,7 @@ def _running_test_script(
             env=command_env,
             timeout=command_timeout,
             raise_on_timeout=not is_long_running,
+            pip=test.get_byod_pips(),
         )
     except (
         TestCommandError,
@@ -408,7 +377,7 @@ def _fetching_results(
         command_results["smoke_test"] = True
 
     result.results = command_results
-    result.status = "finished"
+    result.status = ResultStatus.SUCCESS.value
 
     return metrics, fetch_result_exception
 
@@ -417,12 +386,13 @@ def run_release_test(
     test: Test,
     anyscale_project: str,
     result: Result,
-    ray_wheels_url: str,
     reporters: Optional[List[Reporter]] = None,
     smoke_test: bool = False,
     cluster_id: Optional[str] = None,
     cluster_env_id: Optional[str] = None,
     no_terminate: bool = False,
+    test_definition_root: Optional[str] = None,
+    log_streaming_limit: int = LAST_LOGS_LENGTH,
 ) -> Result:
     old_wd = os.getcwd()
     start_time = time.monotonic()
@@ -437,9 +407,10 @@ def run_release_test(
             test,
             anyscale_project,
             result,
-            ray_wheels_url,
             smoke_test,
             no_terminate,
+            test_definition_root,
+            log_streaming_limit,
         )
         buildkite_group(":nut_and_bolt: Setting up cluster environment")
         (
@@ -452,14 +423,10 @@ def run_release_test(
             test,
             result,
             cluster_manager,
-            ray_wheels_url,
             cluster_env_id,
+            test_definition_root,
         )
 
-        buildkite_group(":nut_and_bolt: Setting up local environment")
-        _setup_local_environment(test, command_runner, ray_wheels_url)
-
-        # Print installed pip packages
         buildkite_group(":bulb: Local environment information")
         _local_environment_information(
             result,

@@ -1,26 +1,50 @@
 import importlib
 import logging
 import os
-from typing import Any, List, Union, Optional, TYPE_CHECKING
-from types import ModuleType
+import pathlib
+import random
 import sys
+import threading
+import time
+import urllib.parse
+from collections import deque
+from types import ModuleType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 
 import ray
-from ray.air.constants import TENSOR_COLUMN_NAME
-from ray.data._internal.arrow_ops.transform_pyarrow import unify_schemas
-from ray.data.context import DataContext
 from ray._private.utils import _get_pyarrow_version
+from ray.data.context import DEFAULT_READ_OP_MIN_NUM_BLOCKS, WARN_PREFIX, DataContext
 
 if TYPE_CHECKING:
-    from ray.data.datasource import Reader
-    from ray.util.placement_group import PlacementGroup
-    import pyarrow
     import pandas
-    from ray.data.block import Block, BlockMetadata
+    import pyarrow
+
+    from ray.data._internal.compute import ComputeStrategy
+    from ray.data._internal.planner.exchange.sort_task_spec import SortKey
+    from ray.data.block import Block, BlockMetadata, UserDefinedFunction
+    from ray.data.datasource import Datasource, Reader
+    from ray.util.placement_group import PlacementGroup
 
 logger = logging.getLogger(__name__)
+
+
+KiB = 1024  # bytes
+MiB = 1024 * KiB
+GiB = 1024 * MiB
+
 
 # NOTE: Make sure that these lower and upper bounds stay in sync with version
 # constraints given in python/setup.py.
@@ -34,6 +58,31 @@ _EXAMPLE_SCHEME = "example"
 
 LazyModule = Union[None, bool, ModuleType]
 _pyarrow_dataset: LazyModule = None
+
+
+class _NullSentinel:
+    """Sentinel value that sorts greater than any other value."""
+
+    def __eq__(self, other):
+        return isinstance(other, _NullSentinel)
+
+    def __lt__(self, other):
+        return False
+
+    def __le__(self, other):
+        return isinstance(other, _NullSentinel)
+
+    def __gt__(self, other):
+        return True
+
+    def __ge__(self, other):
+        return True
+
+    def __hash__(self):
+        return id(self)
+
+
+NULL_SENTINEL = _NullSentinel()
 
 
 def _lazy_import_pyarrow_dataset() -> LazyModule:
@@ -59,7 +108,7 @@ def _check_pyarrow_version():
 
         version = _get_pyarrow_version()
         if version is not None:
-            from pkg_resources._vendor.packaging.version import parse as parse_version
+            from packaging.version import parse as parse_version
 
             if parse_version(version) < parse_version(MIN_PYARROW_VERSION):
                 raise ImportError(
@@ -83,16 +132,20 @@ def _check_pyarrow_version():
 
 def _autodetect_parallelism(
     parallelism: int,
-    cur_pg: Optional["PlacementGroup"],
+    target_max_block_size: int,
     ctx: DataContext,
-    reader: Optional["Reader"] = None,
+    datasource_or_legacy_reader: Optional[Union["Datasource", "Reader"]] = None,
+    mem_size: Optional[int] = None,
+    placement_group: Optional["PlacementGroup"] = None,
     avail_cpus: Optional[int] = None,
-) -> (int, int):
+) -> Tuple[int, str, Optional[int]]:
     """Returns parallelism to use and the min safe parallelism to avoid OOMs.
 
     This detects parallelism using the following heuristics, applied in order:
 
-     1) We start with the default parallelism of 200.
+     1) We start with the default value of 200. This can be overridden by
+        setting the `read_op_min_num_blocks` attribute of
+        :class:`~ray.data.context.DataContext`.
      2) Min block size. If the parallelism would make blocks smaller than this
         threshold, the parallelism is reduced to avoid the overhead of tiny blocks.
      3) Max block size. If the parallelism would make blocks larger than this
@@ -102,42 +155,88 @@ def _autodetect_parallelism(
 
     Args:
         parallelism: The user-requested parallelism, or -1 for auto-detection.
-        cur_pg: The current placement group, to be used for avail cpu calculation.
+        target_max_block_size: The target max block size to
+            produce. We pass this separately from the
+            DatasetContext because it may be set per-op instead of
+            per-Dataset.
         ctx: The current Dataset context to use for configs.
-        reader: The datasource reader, to be used for data size estimation.
+        datasource_or_legacy_reader: The datasource or legacy reader, to be used for
+            data size estimation.
+        mem_size: If passed, then used to compute the parallelism according to
+            target_max_block_size.
+        placement_group: The placement group that this Dataset
+            will execute inside, if any.
         avail_cpus: Override avail cpus detection (for testing only).
 
     Returns:
-        Tuple of detected parallelism (only if -1 was specified), and the min safe
-        parallelism (which can be used to generate warnings about large blocks).
+        Tuple of detected parallelism (only if -1 was specified), the reason
+        for the detected parallelism (only if -1 was specified), and the estimated
+        inmemory size of the dataset.
     """
     min_safe_parallelism = 1
     max_reasonable_parallelism = sys.maxsize
-    if reader:
-        mem_size = reader.estimate_inmemory_data_size()
-        if mem_size is not None and not np.isnan(mem_size):
-            min_safe_parallelism = max(1, int(mem_size / ctx.target_max_block_size))
-            max_reasonable_parallelism = max(
-                1, int(mem_size / ctx.target_min_block_size)
-            )
-    else:
-        mem_size = None
+    if mem_size is None and datasource_or_legacy_reader:
+        mem_size = datasource_or_legacy_reader.estimate_inmemory_data_size()
+    if mem_size is not None and not np.isnan(mem_size):
+        min_safe_parallelism = max(1, int(mem_size / target_max_block_size))
+        max_reasonable_parallelism = max(1, int(mem_size / ctx.target_min_block_size))
+
+    reason = ""
     if parallelism < 0:
         if parallelism != -1:
             raise ValueError("`parallelism` must either be -1 or a positive integer.")
+
+        if (
+            ctx.min_parallelism is not None
+            and ctx.min_parallelism != DEFAULT_READ_OP_MIN_NUM_BLOCKS
+            and ctx.read_op_min_num_blocks == DEFAULT_READ_OP_MIN_NUM_BLOCKS
+        ):
+            logger.warning(
+                "``DataContext.min_parallelism`` is deprecated in Ray 2.10. "
+                "Please specify ``DataContext.read_op_min_num_blocks`` instead."
+            )
+            ctx.read_op_min_num_blocks = ctx.min_parallelism
+
         # Start with 2x the number of cores as a baseline, with a min floor.
-        avail_cpus = avail_cpus or _estimate_avail_cpus(cur_pg)
+        if placement_group is None:
+            placement_group = ray.util.get_current_placement_group()
+        avail_cpus = avail_cpus or _estimate_avail_cpus(placement_group)
         parallelism = max(
-            min(ctx.min_parallelism, max_reasonable_parallelism),
+            min(ctx.read_op_min_num_blocks, max_reasonable_parallelism),
             min_safe_parallelism,
             avail_cpus * 2,
         )
+
+        if parallelism == ctx.read_op_min_num_blocks:
+            reason = (
+                "DataContext.get_current().read_op_min_num_blocks="
+                f"{ctx.read_op_min_num_blocks}"
+            )
+        elif parallelism == max_reasonable_parallelism:
+            reason = (
+                "output blocks of size at least "
+                "DataContext.get_current().target_min_block_size="
+                f"{ctx.target_min_block_size / (1024 * 1024)}MiB"
+            )
+        elif parallelism == min_safe_parallelism:
+            reason = (
+                "output blocks of size at most "
+                "DataContext.get_current().target_max_block_size="
+                f"{ctx.target_max_block_size / (1024 * 1024)}MiB"
+            )
+        else:
+            reason = (
+                "parallelism at least twice the available number "
+                f"of CPUs ({avail_cpus})"
+            )
+
         logger.debug(
             f"Autodetected parallelism={parallelism} based on "
             f"estimated_available_cpus={avail_cpus} and "
             f"estimated_data_size={mem_size}."
         )
-    return parallelism, min_safe_parallelism
+
+    return parallelism, reason, mem_size
 
 
 def _estimate_avail_cpus(cur_pg: Optional["PlacementGroup"]) -> int:
@@ -181,6 +280,25 @@ def _estimate_available_parallelism() -> int:
     return _estimate_avail_cpus(cur_pg)
 
 
+def _warn_on_high_parallelism(requested_parallelism, num_read_tasks):
+    available_cpu_slots = ray.available_resources().get("CPU", 1)
+    if (
+        requested_parallelism
+        and num_read_tasks > available_cpu_slots * 4
+        and num_read_tasks >= 5000
+    ):
+        logger.warning(
+            f"{WARN_PREFIX} The requested parallelism of {requested_parallelism} "
+            "is more than 4x the number of available CPU slots in the cluster of "
+            f"{available_cpu_slots}. This can "
+            "lead to slowdowns during the data reading phase due to excessive "
+            "task creation. Reduce the parallelism to match with the available "
+            "CPU slots in the cluster, or set parallelism to -1 for Ray Data "
+            "to automatically determine the parallelism. "
+            "You can ignore this message if the cluster is expected to autoscale."
+        )
+
+
 def _check_import(obj, *, module: str, package: str) -> None:
     """Check if a required dependency is installed.
 
@@ -208,9 +326,6 @@ def _resolve_custom_scheme(path: str) -> str:
 
     The supported custom schemes are: "local", "example".
     """
-    import pathlib
-    import urllib.parse
-
     parsed_uri = urllib.parse.urlparse(path)
     if parsed_uri.scheme == _LOCAL_SCHEME:
         path = parsed_uri.netloc + parsed_uri.path
@@ -226,9 +341,6 @@ def _is_local_scheme(paths: Union[str, List[str]]) -> bool:
     Note: The paths must be in same scheme, i.e. it's invalid and
     will raise error if paths are mixed with different schemes.
     """
-    import pathlib
-    import urllib.parse
-
     if isinstance(paths, str):
         paths = [paths]
     if isinstance(paths, pathlib.Path):
@@ -244,10 +356,6 @@ def _is_local_scheme(paths: Union[str, List[str]]) -> bool:
             f"but found mixed {paths}"
         )
     return num == len(paths)
-
-
-def _is_tensor_schema(column_names: List[str]):
-    return column_names == [TENSOR_COLUMN_NAME]
 
 
 def _truncated_repr(obj: Any) -> str:
@@ -394,21 +502,137 @@ def ConsumptionAPI(*args, **kwargs):
     return _consumption_api(*args, **kwargs)
 
 
-def _split_list(arr: List[Any], num_splits: int) -> List[List[Any]]:
-    """Split the list into `num_splits` lists.
-
-    The splits will be even if the `num_splits` divides the length of list, otherwise
-    the remainder (suppose it's R) will be allocated to the first R splits (one for
-    each).
-    This is the same as numpy.array_split(). The reason we make this a separate
-    implementation is to allow the heterogeneity in the elements in the list.
+def _all_to_all_api(*args, **kwargs):
+    """Annotate the function with an indication that it's a all to all API, and that it
+    is an operation that requires all inputs to be materialized in-memory to execute.
     """
-    assert num_splits > 0
-    q, r = divmod(len(arr), num_splits)
-    splits = [
-        arr[i * q + min(i, r) : (i + 1) * q + min(i + 1, r)] for i in range(num_splits)
-    ]
-    return splits
+
+    def wrap(obj):
+        _insert_doc_at_pattern(
+            obj,
+            message=(
+                "This operation requires all inputs to be "
+                "materialized in object store for it to execute."
+            ),
+            pattern="Examples:",
+            insert_after=False,
+            directive="note",
+        )
+        return obj
+
+    return wrap
+
+
+def AllToAllAPI(*args, **kwargs):
+    """Annotate the function with an indication that it's a all to all API, and that it
+    is an operation that requires all inputs to be materialized in-memory to execute.
+    """
+    # This should only be used as a decorator for dataset methods.
+    assert len(args) == 1 and len(kwargs) == 0 and callable(args[0])
+    return _all_to_all_api()(args[0])
+
+
+def get_compute_strategy(
+    fn: "UserDefinedFunction",
+    fn_constructor_args: Optional[Iterable[Any]] = None,
+    compute: Optional[Union[str, "ComputeStrategy"]] = None,
+    concurrency: Optional[Union[int, Tuple[int, int]]] = None,
+) -> "ComputeStrategy":
+    """Get `ComputeStrategy` based on the function or class, and concurrency
+    information.
+
+    Args:
+        fn: The function or generator to apply to a record batch, or a class type
+            that can be instantiated to create such a callable.
+        fn_constructor_args: Positional arguments to pass to ``fn``'s constructor.
+        compute: Either "tasks" (default) to use Ray Tasks or an
+                :class:`~ray.data.ActorPoolStrategy` to use an autoscaling actor pool.
+        concurrency: The number of Ray workers to use concurrently.
+
+    Returns:
+       The `ComputeStrategy` for execution.
+    """
+    # Lazily import these objects to avoid circular imports.
+    from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
+    from ray.data.block import CallableClass
+
+    if isinstance(fn, CallableClass):
+        is_callable_class = True
+    else:
+        # TODO(chengsu): disallow object that is not a function. For example,
+        # An object instance of class often indicates a bug in user code.
+        is_callable_class = False
+        if fn_constructor_args is not None:
+            raise ValueError(
+                "``fn_constructor_args`` can only be specified if providing a "
+                f"callable class instance for ``fn``, but got: {fn}."
+            )
+
+    if compute is not None:
+        # Legacy code path to support `compute` argument.
+        logger.warning(
+            "The argument ``compute`` is deprecated in Ray 2.9. Please specify "
+            "argument ``concurrency`` instead. For more information, see "
+            "https://docs.ray.io/en/master/data/transforming-data.html#"
+            "stateful-transforms."
+        )
+        if is_callable_class and (
+            compute == "tasks" or isinstance(compute, TaskPoolStrategy)
+        ):
+            raise ValueError(
+                "``compute`` must specify an actor compute strategy when using a "
+                f"callable class, but got: {compute}. For example, use "
+                "``compute=ray.data.ActorPoolStrategy(size=n)``."
+            )
+        elif not is_callable_class and (
+            compute == "actors" or isinstance(compute, ActorPoolStrategy)
+        ):
+            raise ValueError(
+                f"``compute`` is specified as the actor compute strategy: {compute}, "
+                f"but ``fn`` is not a callable class: {fn}. Pass a callable class or "
+                "use the default ``compute`` strategy."
+            )
+        return compute
+    elif concurrency is not None:
+        if isinstance(concurrency, tuple):
+            if (
+                len(concurrency) == 2
+                and isinstance(concurrency[0], int)
+                and isinstance(concurrency[1], int)
+            ):
+                if is_callable_class:
+                    return ActorPoolStrategy(
+                        min_size=concurrency[0], max_size=concurrency[1]
+                    )
+                else:
+                    raise ValueError(
+                        "``concurrency`` is set as a tuple of integers, but ``fn`` "
+                        f"is not a callable class: {fn}. Use ``concurrency=n`` to "
+                        "control maximum number of workers to use."
+                    )
+            else:
+                raise ValueError(
+                    "``concurrency`` is expected to be set as a tuple of "
+                    f"integers, but got: {concurrency}."
+                )
+        elif isinstance(concurrency, int):
+            if is_callable_class:
+                return ActorPoolStrategy(size=concurrency)
+            else:
+                return TaskPoolStrategy(size=concurrency)
+        else:
+            raise ValueError(
+                "``concurrency`` is expected to be set as an integer or a "
+                f"tuple of integers, but got: {concurrency}."
+            )
+    else:
+        if is_callable_class:
+            raise ValueError(
+                "``concurrency`` must be specified when using a callable class. "
+                "For example, use ``concurrency=n`` for a pool of ``n`` workers."
+            )
+        else:
+            return TaskPoolStrategy()
 
 
 def capfirst(s: str):
@@ -438,15 +662,11 @@ def capitalize(s: str):
 def pandas_df_to_arrow_block(df: "pandas.DataFrame") -> "Block":
     from ray.data.block import BlockAccessor, BlockExecStats
 
+    block = BlockAccessor.for_block(df).to_arrow()
     stats = BlockExecStats.builder()
-    import pyarrow as pa
-
-    block = pa.table(df)
     return (
         block,
-        BlockAccessor.for_block(block).get_metadata(
-            input_files=None, exec_stats=stats.build()
-        ),
+        BlockAccessor.for_block(block).get_metadata(exec_stats=stats.build()),
     )
 
 
@@ -456,13 +676,8 @@ def ndarray_to_block(ndarray: np.ndarray, ctx: DataContext) -> "Block":
     DataContext._set_current(ctx)
 
     stats = BlockExecStats.builder()
-    if ctx.strict_mode:
-        block = BlockAccessor.batch_to_block({"data": ndarray})
-    else:
-        block = BlockAccessor.batch_to_block(ndarray)
-    metadata = BlockAccessor.for_block(block).get_metadata(
-        input_files=None, exec_stats=stats.build()
-    )
+    block = BlockAccessor.batch_to_block({"data": ndarray})
+    metadata = BlockAccessor.for_block(block).get_metadata(exec_stats=stats.build())
     return block, metadata
 
 
@@ -472,9 +687,7 @@ def get_table_block_metadata(
     from ray.data.block import BlockAccessor, BlockExecStats
 
     stats = BlockExecStats.builder()
-    return BlockAccessor.for_block(table).get_metadata(
-        input_files=None, exec_stats=stats.build()
-    )
+    return BlockAccessor.for_block(table).get_metadata(exec_stats=stats.build())
 
 
 def unify_block_metadata_schema(
@@ -485,6 +698,7 @@ def unify_block_metadata_schema(
     """
     # Some blocks could be empty, in which case we cannot get their schema.
     # TODO(ekl) validate schema is the same across different blocks.
+    from ray.data._internal.arrow_ops.transform_pyarrow import unify_schemas
 
     # First check if there are blocks with computed schemas, then unify
     # valid schemas from all such blocks.
@@ -499,9 +713,411 @@ def unify_block_metadata_schema(
         except ImportError:
             pa = None
         # If the result contains PyArrow schemas, unify them
-        if pa is not None and any(isinstance(s, pa.Schema) for s in schemas_to_unify):
+        if pa is not None and all(isinstance(s, pa.Schema) for s in schemas_to_unify):
             return unify_schemas(schemas_to_unify)
         # Otherwise, if the resulting schemas are simple types (e.g. int),
         # return the first schema.
         return schemas_to_unify[0]
     return None
+
+
+def find_partition_index(
+    table: Union["pyarrow.Table", "pandas.DataFrame"],
+    desired: Tuple[Union[int, float]],
+    sort_key: "SortKey",
+) -> int:
+    """For the given block, find the index where the desired value should be
+    added, to maintain sorted order.
+
+    We do this by iterating over each column, starting with the primary sort key,
+    and binary searching for the desired value in the column. Each binary search
+    shortens the "range" of indices (represented by ``left`` and ``right``, which
+    are indices of rows) where the desired value could be inserted.
+
+    Args:
+        table: The block to search in.
+        desired: A single tuple representing the boundary to partition at.
+            ``len(desired)`` must be less than or equal to the number of columns
+            being sorted.
+        sort_key: The sort key to use for sorting, providing the columns to be
+            sorted and their directions.
+
+    Returns:
+        The index where the desired value should be inserted to maintain sorted
+        order.
+    """
+    columns = sort_key.get_columns()
+    descending = sort_key.get_descending()
+
+    left, right = 0, len(table)
+    for i in range(len(desired)):
+        if left == right:
+            return right
+        col_name = columns[i]
+        col_vals = table[col_name].to_numpy()[left:right]
+        desired_val = desired[i]
+
+        # Handle null values - replace them with sentinel values
+        if desired_val is None:
+            desired_val = NULL_SENTINEL
+
+        # Replace None/NaN values in col_vals with sentinel
+        null_mask = col_vals == None  # noqa: E711
+        if null_mask.any():
+            col_vals = col_vals.copy()  # Make a copy to avoid modifying original
+            col_vals[null_mask] = NULL_SENTINEL
+
+        prevleft = left
+        if descending[i] is True:
+            # ``np.searchsorted`` expects the array to be sorted in ascending
+            # order, so we pass ``sorter``, which is an array of integer indices
+            # that sort ``col_vals`` into ascending order. The returned index
+            # is an index into the ascending order of ``col_vals``, so we need
+            # to subtract it from ``len(col_vals)`` to get the index in the
+            # original descending order of ``col_vals``.
+            left = prevleft + (
+                len(col_vals)
+                - np.searchsorted(
+                    col_vals,
+                    desired_val,
+                    side="right",
+                    sorter=np.arange(len(col_vals) - 1, -1, -1),
+                )
+            )
+            right = prevleft + (
+                len(col_vals)
+                - np.searchsorted(
+                    col_vals,
+                    desired_val,
+                    side="left",
+                    sorter=np.arange(len(col_vals) - 1, -1, -1),
+                )
+            )
+        else:
+            left = prevleft + np.searchsorted(col_vals, desired_val, side="left")
+            right = prevleft + np.searchsorted(col_vals, desired_val, side="right")
+    return right if descending[0] is True else left
+
+
+def find_partitions(
+    table: Union["pyarrow.Table", "pandas.DataFrame"],
+    boundaries: List[Tuple[Union[int, float]]],
+    sort_key: "SortKey",
+):
+    partitions = []
+
+    # For each boundary value, count the number of items that are less
+    # than it. Since the block is sorted, these counts partition the items
+    # such that boundaries[i] <= x < boundaries[i + 1] for each x in
+    # partition[i]. If `descending` is true, `boundaries` would also be
+    # in descending order and we only need to count the number of items
+    # *greater than* the boundary value instead.
+    bounds = [
+        find_partition_index(table, boundary, sort_key) for boundary in boundaries
+    ]
+
+    last_idx = 0
+    for idx in bounds:
+        partitions.append(table[last_idx:idx])
+        last_idx = idx
+    partitions.append(table[last_idx:])
+    return partitions
+
+
+def get_attribute_from_class_name(class_name: str) -> Any:
+    """Get Python attribute from the provided class name.
+
+    The caller needs to make sure the provided class name includes
+    full module name, and can be imported successfully.
+    """
+    from importlib import import_module
+
+    paths = class_name.split(".")
+    if len(paths) < 2:
+        raise ValueError(f"Cannot create object from {class_name}.")
+
+    module_name = ".".join(paths[:-1])
+    attribute_name = paths[-1]
+    return getattr(import_module(module_name), attribute_name)
+
+
+class Queue:
+    """A thread-safe queue implementation for multiple producers and consumers.
+
+    Provide `release()` to exit producer threads cooperatively for resource release.
+    """
+
+    def __init__(self, queue_size: int):
+        # The queue shared across multiple producer threads.
+        self._queue = deque()
+        # The boolean varilable to indicate whether producer threads should exit.
+        self._threads_exit = False
+        # The semaphore for producer threads to put item into queue.
+        self._producer_semaphore = threading.Semaphore(queue_size)
+        # The semaphore for consumer threads to get item from queue.
+        self._consumer_semaphore = threading.Semaphore(0)
+        # The mutex lock to guard access of `self._queue` and `self._threads_exit`.
+        self._mutex = threading.Lock()
+
+    def put(self, item: Any) -> bool:
+        """Put an item into the queue.
+
+        Block if necessary until a free slot is available in queue.
+        This method is called by producer threads.
+
+        Returns:
+            True if the caller thread should exit immediately.
+        """
+        self._producer_semaphore.acquire()
+        with self._mutex:
+            if self._threads_exit:
+                return True
+            else:
+                self._queue.append(item)
+        self._consumer_semaphore.release()
+        return False
+
+    def get(self) -> Any:
+        """Remove and return an item from the queue.
+
+        Block if necessary until an item is available in queue.
+        This method is called by consumer threads.
+        """
+        self._consumer_semaphore.acquire()
+        with self._mutex:
+            next_item = self._queue.popleft()
+        self._producer_semaphore.release()
+        return next_item
+
+    def release(self, num_threads: int):
+        """Release `num_threads` of producers so they would exit cooperatively."""
+        with self._mutex:
+            self._threads_exit = True
+        for _ in range(num_threads):
+            # NOTE: After Python 3.9+, Semaphore.release(n) can be used to
+            # release all threads at once.
+            self._producer_semaphore.release()
+
+    def qsize(self):
+        """Return the size of the queue."""
+        with self._mutex:
+            return len(self._queue)
+
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+
+def make_async_gen(
+    base_iterator: Iterator[T],
+    fn: Callable[[Iterator[T]], Iterator[U]],
+    num_workers: int = 1,
+) -> Iterator[U]:
+    """Returns a new iterator with elements fetched from the base_iterator
+    in an async fashion using a threadpool.
+
+    Each thread in the threadpool will fetch data from the base_iterator in a
+    thread-safe fashion, and apply the provided `fn` computation concurrently.
+
+    Args:
+        base_iterator: The iterator to asynchronously fetch from.
+        fn: The function to run on the input iterator.
+        num_workers: The number of threads to use in the threadpool. Defaults to 1.
+
+    Returns:
+        An iterator with the same elements as outputted from `fn`.
+    """
+
+    if num_workers < 1:
+        raise ValueError("Size of threadpool must be at least 1.")
+
+    # Use a lock to fetch from the base_iterator in a thread-safe fashion.
+    def convert_to_threadsafe_iterator(base_iterator: Iterator[T]) -> Iterator[T]:
+        class ThreadSafeIterator:
+            def __init__(self, it):
+                self.lock = threading.Lock()
+                self.it = it
+
+            def __next__(self):
+                with self.lock:
+                    return next(self.it)
+
+            def __iter__(self):
+                return self
+
+        return ThreadSafeIterator(base_iterator)
+
+    thread_safe_generator = convert_to_threadsafe_iterator(base_iterator)
+
+    class Sentinel:
+        def __init__(self, thread_index: int):
+            self.thread_index = thread_index
+
+    output_queue = Queue(1)
+
+    # Because pulling from the base iterator cannot happen concurrently,
+    # we must execute the expensive computation in a separate step which
+    # can be parallelized via a threadpool.
+    def execute_computation(thread_index: int):
+        try:
+            for item in fn(thread_safe_generator):
+                if output_queue.put(item):
+                    # Return early when it's instructed to do so.
+                    return
+            output_queue.put(Sentinel(thread_index))
+        except Exception as e:
+            output_queue.put(e)
+
+    # Use separate threads to produce output batches.
+    threads = [
+        threading.Thread(target=execute_computation, args=(i,), daemon=True)
+        for i in range(num_workers)
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    # Use main thread to consume output batches.
+    num_threads_finished = 0
+    try:
+        while True:
+            next_item = output_queue.get()
+            if isinstance(next_item, Exception):
+                raise next_item
+            if isinstance(next_item, Sentinel):
+                num_threads_finished += 1
+            else:
+                yield next_item
+            if num_threads_finished >= num_workers:
+                break
+    finally:
+        # Cooperatively exit all producer threads.
+        # This is to avoid these daemon threads hanging there with holding batches in
+        # memory, which can cause GRAM OOM easily. This can happen when caller breaks
+        # in the middle of iteration.
+        num_threads_alive = num_workers - num_threads_finished
+        if num_threads_alive > 0:
+            output_queue.release(num_threads_alive)
+
+
+def call_with_retry(
+    f: Callable[[], Any],
+    description: str,
+    *,
+    match: Optional[List[str]] = None,
+    max_attempts: int = 10,
+    max_backoff_s: int = 32,
+) -> Any:
+    """Retry a function with exponential backoff.
+
+    Args:
+        f: The function to retry.
+        match: A list of strings to match in the exception message. If ``None``, any
+            error is retried.
+        description: An imperitive description of the function being retried. For
+            example, "open the file".
+        max_attempts: The maximum number of attempts to retry.
+        max_backoff_s: The maximum number of seconds to backoff.
+    """
+    assert max_attempts >= 1, f"`max_attempts` must be positive. Got {max_attempts}."
+
+    for i in range(max_attempts):
+        try:
+            return f()
+        except Exception as e:
+            is_retryable = match is None or any(
+                [pattern in str(e) for pattern in match]
+            )
+            if is_retryable and i + 1 < max_attempts:
+                # Retry with binary expoential backoff with random jitter.
+                backoff = min((2 ** (i + 1)), max_backoff_s) * random.random()
+                logger.debug(
+                    f"Retrying {i+1} attempts to {description} after {backoff} seconds."
+                )
+                time.sleep(backoff)
+            else:
+                raise e from None
+
+
+def iterate_with_retry(
+    iterable_factory: Callable[[], Iterable],
+    description: str,
+    *,
+    match: Optional[List[str]] = None,
+    max_attempts: int = 10,
+    max_backoff_s: int = 32,
+) -> Any:
+    """Iterate through an iterable with retries.
+
+    If the iterable raises an exception, this function recreates and re-iterates
+    through the iterable, while skipping the items that have already been yielded.
+
+    Args:
+        iterable_factory: A no-argument function that creates the iterable.
+        match: A list of strings to match in the exception message. If ``None``, any
+            error is retried.
+        description: An imperitive description of the function being retried. For
+            example, "open the file".
+        max_attempts: The maximum number of attempts to retry.
+        max_backoff_s: The maximum number of seconds to backoff.
+    """
+    assert max_attempts >= 1, f"`max_attempts` must be positive. Got {max_attempts}."
+
+    num_items_yielded = 0
+    for i in range(max_attempts):
+        try:
+            iterable = iterable_factory()
+            for i, item in enumerate(iterable):
+                if i < num_items_yielded:
+                    # Skip items that have already been yielded.
+                    continue
+
+                num_items_yielded += 1
+                yield item
+            return
+        except Exception as e:
+            is_retryable = match is None or any(
+                [pattern in str(e) for pattern in match]
+            )
+            if is_retryable and i + 1 < max_attempts:
+                # Retry with binary expoential backoff with random jitter.
+                backoff = min((2 ** (i + 1)), max_backoff_s) * random.random()
+                logger.debug(
+                    f"Retrying {i+1} attempts to {description} after {backoff} seconds."
+                )
+                time.sleep(backoff)
+            else:
+                raise e from None
+
+
+def create_dataset_tag(dataset_name: Optional[str], *args):
+    tag = dataset_name or "dataset"
+    for arg in args:
+        tag += f"_{arg}"
+    return tag
+
+
+def convert_bytes_to_human_readable_str(num_bytes: int) -> str:
+    if num_bytes >= 1e9:
+        num_bytes_str = f"{round(num_bytes / 1e9)}GB"
+    elif num_bytes >= 1e6:
+        num_bytes_str = f"{round(num_bytes / 1e6)}MB"
+    else:
+        num_bytes_str = f"{round(num_bytes / 1e3)}KB"
+    return num_bytes_str
+
+
+def is_nan(value):
+    try:
+        return isinstance(value, float) and np.isnan(value)
+    except TypeError:
+        return False
+
+
+def keys_equal(keys1, keys2):
+    if len(keys1) != len(keys2):
+        return False
+    for k1, k2 in zip(keys1, keys2):
+        if not ((is_nan(k1) and is_nan(k2)) or k1 == k2):
+            return False
+    return True

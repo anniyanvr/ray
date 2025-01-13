@@ -17,7 +17,6 @@ from ray.rllib.algorithms.dqn.dqn_tf_policy import (
 )
 from ray.rllib.algorithms.sac.sac_tf_model import SACTFModel
 from ray.rllib.algorithms.sac.sac_torch_model import SACTorchModel
-from ray.rllib.evaluation.episode import Episode
 from ray.rllib.models import ModelCatalog
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.models.tf.tf_action_dist import (
@@ -61,7 +60,7 @@ def build_sac_model(
         policy: The TFPolicy that will use the models.
         obs_space (gym.spaces.Space): The observation space.
         action_space (gym.spaces.Space): The action space.
-        config: The SAC trainer's config dict.
+        config: The SACConfig object.
 
     Returns:
         ModelV2: The ModelV2 to be used by the Policy. Note: An additional
@@ -123,7 +122,7 @@ def postprocess_trajectory(
     policy: Policy,
     sample_batch: SampleBatch,
     other_agent_batches: Optional[Dict[AgentID, SampleBatch]] = None,
-    episode: Optional[Episode] = None,
+    episode=None,
 ) -> SampleBatch:
     """Postprocesses a trajectory and returns the processed trajectory.
 

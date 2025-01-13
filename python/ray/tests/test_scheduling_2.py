@@ -9,12 +9,19 @@ import pytest
 import ray
 import ray._private.gcs_utils as gcs_utils
 import ray.experimental.internal_kv as internal_kv
-from ray._private.test_utils import make_global_state_accessor, wait_for_condition
+from ray._private.test_utils import (
+    make_global_state_accessor,
+    wait_for_condition,
+    get_metric_check_condition,
+    MetricSamplePattern,
+)
 from ray.util.client.ray_client_helpers import connect_to_client_or_not
+from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import (
     NodeAffinitySchedulingStrategy,
     PlacementGroupSchedulingStrategy,
 )
+from ray._private.test_utils import SignalActor
 
 
 @pytest.mark.skipif(
@@ -259,7 +266,7 @@ def test_node_affinity_scheduling_strategy(
 
         @ray.remote
         def get_node_id():
-            return ray.get_runtime_context().node_id
+            return ray.get_runtime_context().get_node_id()
 
         head_node_id = ray.get(
             get_node_id.options(num_cpus=0, resources={"head": 1}).remote()
@@ -338,14 +345,14 @@ def test_node_affinity_scheduling_strategy(
             ),
         )
         def crashed_get_node_id():
-            if ray.get_runtime_context().node_id == crashed_worker_node_id:
+            if ray.get_runtime_context().get_node_id() == crashed_worker_node_id:
                 internal_kv._internal_kv_put(
                     "crashed_get_node_id", "crashed_worker_node_id"
                 )
                 while True:
                     time.sleep(1)
             else:
-                return ray.get_runtime_context().node_id
+                return ray.get_runtime_context().get_node_id()
 
         r = crashed_get_node_id.remote()
         while not internal_kv._internal_kv_exists("crashed_get_node_id"):
@@ -356,7 +363,7 @@ def test_node_affinity_scheduling_strategy(
         @ray.remote(num_cpus=1)
         class Actor:
             def get_node_id(self):
-                return ray.get_runtime_context().node_id
+                return ray.get_runtime_context().get_node_id()
 
         actor = Actor.options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(
@@ -466,6 +473,29 @@ def test_node_affinity_scheduling_strategy_spill_on_unavailable(ray_start_cluste
     assert target_node_id != soft_node_id
 
 
+def test_node_affinity_scheduling_strategy_fail_on_unavailable(ray_start_cluster):
+    cluster = ray_start_cluster
+    cluster.add_node(num_cpus=1)
+    ray.init(address=cluster.address)
+
+    @ray.remote(num_cpus=1)
+    class Actor:
+        def get_node_id(self):
+            return ray.get_runtime_context().get_node_id()
+
+    a1 = Actor.remote()
+    target_node_id = ray.get(a1.get_node_id.remote())
+
+    a2 = Actor.options(
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            target_node_id, soft=False, _fail_on_unavailable=True
+        )
+    ).remote()
+
+    with pytest.raises(ray.exceptions.ActorUnschedulableError):
+        ray.get(a2.get_node_id.remote())
+
+
 @pytest.mark.parametrize("connect_to_client", [True, False])
 def test_spread_scheduling_strategy(ray_start_cluster, connect_to_client):
     cluster = ray_start_cluster
@@ -542,8 +572,9 @@ def test_spread_scheduling_strategy(ray_start_cluster, connect_to_client):
 @pytest.mark.skipif(
     platform.system() == "Windows", reason="FakeAutoscaler doesn't work on Windows"
 )
+@pytest.mark.parametrize("autoscaler_v2", [False, True], ids=["v1", "v2"])
 def test_demand_report_for_node_affinity_scheduling_strategy(
-    monkeypatch, shutdown_only
+    autoscaler_v2, monkeypatch, shutdown_only
 ):
     from ray.cluster_utils import AutoscalingCluster
 
@@ -560,6 +591,7 @@ def test_demand_report_for_node_affinity_scheduling_strategy(
                 "max_workers": 1,
             },
         },
+        autoscaler_v2=autoscaler_v2,
     )
 
     cluster.start()
@@ -621,7 +653,8 @@ def test_demand_report_for_node_affinity_scheduling_strategy(
     platform.system() == "Windows", reason="FakeAutoscaler doesn't work on Windows"
 )
 @pytest.mark.skipif(os.environ.get("ASAN_OPTIONS") is not None, reason="ASAN is slow")
-def test_demand_report_when_scale_up(shutdown_only):
+@pytest.mark.parametrize("autoscaler_v2", [True, False], ids=["v2", "v1"])
+def test_demand_report_when_scale_up(autoscaler_v2, shutdown_only):
     # https://github.com/ray-project/ray/issues/22122
     from ray.cluster_utils import AutoscalingCluster
 
@@ -638,6 +671,9 @@ def test_demand_report_when_scale_up(shutdown_only):
                 "max_workers": 10,
             },
         },
+        autoscaler_v2=autoscaler_v2,
+        max_workers=20,  # default 8
+        upscaling_speed=5,  # greater upscaling speed
     )
 
     cluster.start()
@@ -689,6 +725,7 @@ def test_demand_report_when_scale_up(shutdown_only):
     # Wait for 20s for the cluster to be up
     wait_for_condition(check_backlog_info, 20)
     cluster.shutdown()
+    ray.shutdown()
 
 
 def test_data_locality_spilled_objects(
@@ -733,6 +770,86 @@ def test_data_locality_spilled_objects(
         task = check_locality.remote(x)
         print(i, x, task)
         ray.get(task)
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="Metrics flake on Windows.")
+def test_workload_placement_metrics(ray_start_regular):
+    @ray.remote(num_cpus=1)
+    def task():
+        pass
+
+    @ray.remote(num_cpus=1)
+    class Actor:
+        def ready(self):
+            return True
+
+    t = task.remote()
+    ray.get(t)
+    a = Actor.remote()
+    ray.get(a.ready.remote())
+    del a
+    pg = placement_group(bundles=[{"CPU": 1}], strategy="SPREAD")
+    ray.get(pg.ready())
+
+    placement_metric_condition = get_metric_check_condition(
+        [
+            MetricSamplePattern(
+                name="ray_scheduler_placement_time_s_bucket",
+                value=1.0,
+                partial_label_match={"WorkloadType": "Actor"},
+            ),
+            MetricSamplePattern(
+                name="ray_scheduler_placement_time_s_bucket",
+                value=1.0,
+                partial_label_match={"WorkloadType": "Task"},
+            ),
+            MetricSamplePattern(
+                name="ray_scheduler_placement_time_s_bucket",
+                value=1.0,
+                partial_label_match={"WorkloadType": "PlacementGroup"},
+            ),
+        ],
+    )
+    wait_for_condition(placement_metric_condition, timeout=60)
+
+
+def test_negative_resource_availability(shutdown_only):
+    """Test pg scheduling when resource availability is negative."""
+    ray.init(num_cpus=1)
+
+    signal1 = SignalActor.remote()
+    signal2 = SignalActor.remote()
+
+    @ray.remote(num_cpus=0)
+    def child(signal1):
+        ray.get(signal1.wait.remote())
+
+    @ray.remote(num_cpus=1)
+    def parent(signal1, signal2):
+        # Release the CPU resource,
+        # the resource will be acquired by Actor.
+        ray.get(child.remote(signal1))
+        # Re-acquire the CPU resource
+        # the availability should be -1 afterwards.
+        signal2.send.remote()
+        while True:
+            time.sleep(1)
+
+    @ray.remote(num_cpus=1)
+    class Actor:
+        def ping(self):
+            return "hello"
+
+    parent.remote(signal1, signal2)
+    actor = Actor.remote()
+    ray.get(actor.ping.remote())
+    signal1.send.remote()
+    ray.get(signal2.wait.remote())
+    # CPU resource availability should be negative now
+    # and the pg should be pending.
+    pg = placement_group([{"CPU": 1}])
+    with pytest.raises(ray.exceptions.GetTimeoutError):
+        ray.get(pg.ready(), timeout=2)
 
 
 if __name__ == "__main__":

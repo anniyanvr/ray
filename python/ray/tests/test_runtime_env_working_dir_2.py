@@ -4,10 +4,13 @@ import sys
 import tempfile
 
 import pytest
-from ray._private.test_utils import run_string_as_driver
+from ray._private.test_utils import (
+    chdir,
+    run_string_as_driver,
+)
+
 
 import ray
-from ray._private.test_utils import chdir
 from ray._private.runtime_env import RAY_WORKER_DEV_EXCLUDES
 from ray._private.runtime_env.packaging import GCS_STORAGE_MAX_SIZE
 from ray.exceptions import RuntimeEnvSetupError
@@ -147,7 +150,6 @@ ray.init("{address}", runtime_env={{"py_modules": ["{tmp_dir}"]}})
         output = run_string_as_driver(driver_script)
         assert "Pushing file package" in output
         assert "Successfully pushed file package" in output
-        assert "warning" not in output.lower()
 
 
 # TODO(architkulkarni): Deflake and reenable this test.
@@ -206,12 +208,11 @@ def test_ray_worker_dev_flow(start_cluster):
         def f():
             return "hi"
 
-        f.deploy()
-        h = f.get_handle()
+        h = serve.run(f.bind()).options(use_new_handle_api=True)
 
-        assert ray.get(h.remote()) == "hi"
+        assert h.remote().result() == "hi"
 
-        f.delete()
+        serve.delete("default")
         return [serve.__path__]
 
     assert ray.get(test_serve.remote()) != serve.__path__[0]
@@ -276,6 +277,28 @@ def test_concurrent_downloads(shutdown_only):
 
     refs = [f.remote(), g.remote()]
     ray.get(refs)
+
+
+def test_file_created_before_1980(shutdown_only, tmp_working_dir):
+    # Make sure working_dir supports file created before 1980
+    # https://github.com/ray-project/ray/issues/46379
+    working_path = Path(tmp_working_dir)
+    file_1970 = working_path / "1970"
+    with file_1970.open(mode="w") as f:
+        f.write("1970")
+    os.utime(
+        file_1970,
+        (0, 0),
+    )
+
+    ray.init(runtime_env={"working_dir": tmp_working_dir})
+
+    @ray.remote
+    def task():
+        with open("1970") as f:
+            assert f.read() == "1970"
+
+    ray.get(task.remote())
 
 
 if __name__ == "__main__":

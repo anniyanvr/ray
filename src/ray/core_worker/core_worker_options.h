@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "ray/common/buffer.h"
 #include "ray/common/id.h"
 #include "ray/common/ray_object.h"
@@ -44,6 +46,7 @@ struct CoreWorkerOptions {
       const std::string &serialized_retry_exception_allowlist,
       std::vector<std::pair<ObjectID, std::shared_ptr<RayObject>>> *returns,
       std::vector<std::pair<ObjectID, std::shared_ptr<RayObject>>> *dynamic_returns,
+      std::vector<std::pair<ObjectID, bool>> *streaming_generator_returns,
       std::shared_ptr<LocalMemoryBuffer> &creation_task_exception_pb_bytes,
       bool *is_retryable_error,
       // Application error string, empty if no error.
@@ -56,7 +59,15 @@ struct CoreWorkerOptions {
       // used for actor creation task.
       const std::vector<ConcurrencyGroup> &defined_concurrency_groups,
       const std::string name_of_concurrency_group_to_execute,
-      bool is_reattempt)>;
+      bool is_reattempt,
+      // True if the task is for streaming generator.
+      // TODO(sang): Remove it and combine it with dynamic returns.
+      bool is_streaming_generator,
+      // True if task can be retried upon exception.
+      bool retry_exception,
+      // The max number of unconsumed objects where a generator
+      // can run without a pause.
+      int64_t generator_backpressure_num_objects)>;
 
   CoreWorkerOptions()
       : store_socket(""),
@@ -80,16 +91,22 @@ struct CoreWorkerOptions {
         unhandled_exception_handler(nullptr),
         get_lang_stack(nullptr),
         kill_main(nullptr),
+        cancel_async_task(nullptr),
         is_local_mode(false),
         terminate_asyncio_thread(nullptr),
         serialized_job_config(""),
         metrics_agent_port(-1),
-        connect_on_start(true),
         runtime_env_hash(0),
+        cluster_id(ClusterID::Nil()),
         session_name(""),
         entrypoint(""),
         worker_launch_time_ms(-1),
-        worker_launched_time_ms(-1) {}
+        worker_launched_time_ms(-1),
+        assigned_worker_port(std::nullopt),
+        assigned_raylet_id(std::nullopt) {
+    // TODO(hjiang): Add invariant check: for worker, both should be assigned; for driver,
+    // neither should be assigned.
+  }
 
   /// Type of this worker (i.e., DRIVER or WORKER).
   WorkerType worker_type;
@@ -155,6 +172,10 @@ struct CoreWorkerOptions {
   // Function that tries to interrupt the currently running Python thread if its
   // task ID matches the one given.
   std::function<bool(const TaskID &task_id)> kill_main;
+  std::function<void(const TaskID &task_id,
+                     const RayFunction &ray_function,
+                     const std::string name_of_concurrency_group_to_execute)>
+      cancel_async_task;
   /// Is local mode being used.
   bool is_local_mode;
   /// The function to destroy asyncio event and loops.
@@ -164,10 +185,6 @@ struct CoreWorkerOptions {
   /// The port number of a metrics agent that imports metrics from core workers.
   /// -1 means there's no such agent.
   int metrics_agent_port;
-  /// If false, the constructor won't connect and notify raylets that it is
-  /// ready. It should be explicitly startd by a caller using CoreWorker::Start.
-  /// TODO(sang): Use this method for Java and cpp frontend too.
-  bool connect_on_start;
   /// The hash of the runtime env for this worker.
   int runtime_env_hash;
   /// The startup token of the process assigned to it
@@ -176,6 +193,8 @@ struct CoreWorkerOptions {
   /// may not have the same pid as the process the worker pool
   /// starts (due to shim processes).
   StartupToken startup_token{0};
+  /// Cluster ID associated with the core worker.
+  ClusterID cluster_id;
   /// The function to allocate a new object for the memory store.
   /// This allows allocating the objects in the language frontend's memory.
   /// For example, for the Java worker, we can allocate the objects in the JVM heap
@@ -188,6 +207,18 @@ struct CoreWorkerOptions {
   std::string entrypoint;
   int64_t worker_launch_time_ms;
   int64_t worker_launched_time_ms;
+  /// Available port number for the worker.
+  ///
+  /// TODO(hjiang): Figure out how to assign available port at core worker start, also
+  /// need to add an end-to-end integration test.
+  ///
+  /// On the next end-to-end integrartion PR, we should check
+  /// - non-empty for worker
+  /// - and empty for driver
+  std::optional<int> assigned_worker_port;
+  /// Same as [assigned_worker_port], will be assigned for worker, and left empty for
+  /// driver.
+  std::optional<NodeID> assigned_raylet_id;
 };
 }  // namespace core
 }  // namespace ray
