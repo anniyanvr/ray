@@ -2,20 +2,19 @@ import logging
 import random
 import time
 import uuid
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 import ray
 from ray.air.execution._internal.event_manager import RayEventManager
+from ray.air.execution._internal.tracked_actor import TrackedActor
+from ray.air.execution._internal.tracked_actor_task import TrackedActorTask
 from ray.air.execution.resources import (
     AcquiredResources,
     ResourceManager,
     ResourceRequest,
 )
-
-from ray.air.execution._internal.tracked_actor import TrackedActor
-from ray.air.execution._internal.tracked_actor_task import TrackedActorTask
-from ray.exceptions import RayTaskError, RayActorError
+from ray.exceptions import RayActorError, RayTaskError
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +323,7 @@ class RayActorManager:
 
         # Iterate through all resource requests
         for resource_request in self._resource_request_to_pending_actors:
-            if max_actors and started_actors >= max_actors:
+            if max_actors is not None and started_actors >= max_actors:
                 break
 
             # While we have resources ready and there are actors left to schedule
@@ -400,6 +399,8 @@ class RayActorManager:
                 )
 
                 self._enqueue_cached_actor_tasks(tracked_actor=tracked_actor)
+
+                started_actors += 1
 
         return started_actors
 
@@ -545,7 +546,7 @@ class RayActorManager:
         tracked_actor: TrackedActor,
         kill: bool = False,
         stop_future: Optional[ray.ObjectRef] = None,
-    ) -> None:
+    ) -> bool:
         """Remove a tracked actor.
 
         If the actor has already been started, this will stop the actor. This will
@@ -560,17 +561,28 @@ class RayActorManager:
         actor. Otherwise, graceful actor deconstruction will be scheduled after
         all currently tracked futures are resolved.
 
+        This method returns a boolean, indicating if a stop future is tracked and
+        the ``on_stop`` callback will be invoked. If the actor has been alive,
+        this will be ``True``. If the actor hasn't been scheduled, yet, or failed
+        (and triggered the ``on_error`` callback), this will be ``False``.
+
         Args:
             tracked_actor: Tracked actor to be removed.
             kill: If set, will forcefully terminate the actor instead of gracefully
                 scheduling termination.
             stop_future: If set, use this future to track actor termination.
                 Otherwise, schedule a ``__ray_terminate__`` future.
+
+        Returns:
+            Boolean indicating if the actor was previously alive, and thus whether
+            a callback will be invoked once it is terminated.
+
         """
         if tracked_actor.actor_id in self._failed_actor_ids:
             logger.debug(
                 f"Tracked actor already failed, no need to remove: {tracked_actor}"
             )
+            return False
         elif tracked_actor in self._live_actors_to_ray_actors_resources:
             # Ray actor is running.
 
@@ -610,10 +622,11 @@ class RayActorManager:
                 )
 
                 self._tracked_actors_to_state_futures[tracked_actor].add(stop_future)
-
             else:
                 # kill = True
                 self._live_actors_to_kill.add(tracked_actor)
+
+            return True
 
         elif tracked_actor in self._pending_actors_to_attrs:
             # Actor is pending, stop
@@ -624,6 +637,7 @@ class RayActorManager:
             self._resource_manager.cancel_resource_request(
                 resource_request=resource_request
             )
+            return False
         else:
             raise ValueError(f"Unknown tracked actor: {tracked_actor}")
 

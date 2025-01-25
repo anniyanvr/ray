@@ -3,14 +3,18 @@ import logging
 import random
 import time
 from collections import defaultdict
+from typing import TYPE_CHECKING, Any, List, Optional
+
 import numpy as np
-from typing import List, Any, Optional, TYPE_CHECKING
 
 import ray
-from ray.types import ObjectRef
-from ray.data.block import BlockAccessor
-from ray.data.context import DataContext, DEFAULT_SCHEDULING_STRATEGY
+from ray.data._internal.execution.interfaces.ref_bundle import (
+    _ref_bundles_iterator_to_block_refs_list,
+)
 from ray.data._internal.remote_fn import cached_remote_fn
+from ray.data.block import BlockAccessor
+from ray.data.context import DataContext
+from ray.types import ObjectRef
 from ray.util.annotations import PublicAPI
 
 try:
@@ -50,7 +54,8 @@ class RandomAccessDataset:
         logger.info("[setup] Indexing dataset by sort key.")
         sorted_ds = ds.sort(key)
         get_bounds = cached_remote_fn(_get_bounds)
-        blocks = sorted_ds.get_internal_block_refs()
+        bundles = sorted_ds.iter_internal_ref_bundles()
+        blocks = _ref_bundles_iterator_to_block_refs_list(bundles)
 
         logger.info("[setup] Computing block range bounds.")
         bounds = ray.get([get_bounds.remote(b, key) for b in blocks])
@@ -66,10 +71,7 @@ class RandomAccessDataset:
 
         logger.info("[setup] Creating {} random access workers.".format(num_workers))
         ctx = DataContext.get_current()
-        if ctx.scheduling_strategy != DEFAULT_SCHEDULING_STRATEGY:
-            scheduling_strategy = ctx.scheduling_strategy
-        else:
-            scheduling_strategy = "SPREAD"
+        scheduling_strategy = ctx.scheduling_strategy
         self._workers = [
             _RandomAccessWorker.options(scheduling_strategy=scheduling_strategy).remote(
                 key

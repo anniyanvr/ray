@@ -1,3 +1,4 @@
+import copy
 from collections import deque
 
 from ray.data._internal.logical.interfaces import LogicalOperator, LogicalPlan, Rule
@@ -21,7 +22,8 @@ class ReorderRandomizeBlocksRule(Rule):
 
     def apply(self, plan: LogicalPlan) -> LogicalPlan:
         optimized_dag: LogicalOperator = self._apply(plan.dag)
-        return LogicalPlan(dag=optimized_dag)
+        new_plan = LogicalPlan(dag=optimized_dag, context=plan.context)
+        return new_plan
 
     def _apply(self, op: LogicalOperator) -> LogicalOperator:
         operators = []
@@ -43,7 +45,10 @@ class ReorderRandomizeBlocksRule(Rule):
                     # RandomizeBlocks operator.
                     current_seed = upstream_ops[i]._seed
                     if not operators or current_seed or operators[-1]._seed:
-                        operators.append(upstream_ops[i])
+                        # We need to make a copy of the operator.
+                        # Because the operator instance may be shared by multiple
+                        # Datasets. We shouldn't modify it in place.
+                        operators.append(copy.copy(upstream_ops[i]))
 
                     # Remove RandomizeBlocks operator from the dag and wire in new input
                     # dependencies.

@@ -1,7 +1,11 @@
 from typing import Any, Dict, List, Optional
 
 from ray.data._internal.logical.interfaces import LogicalOperator
+from ray.data._internal.planner.exchange.interfaces import ExchangeTaskSpec
+from ray.data._internal.planner.exchange.shuffle_task_spec import ShuffleTaskSpec
+from ray.data._internal.planner.exchange.sort_task_spec import SortKey, SortTaskSpec
 from ray.data.aggregate import AggregateFn
+from ray.data.block import BlockMetadata
 
 
 class AbstractAllToAll(LogicalOperator):
@@ -14,6 +18,7 @@ class AbstractAllToAll(LogicalOperator):
         name: str,
         input_op: LogicalOperator,
         num_outputs: Optional[int] = None,
+        sub_progress_bar_names: Optional[List[str]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
     ):
         """
@@ -24,11 +29,12 @@ class AbstractAllToAll(LogicalOperator):
                 of `input_op` will be the inputs to this operator.
             num_outputs: The number of expected output bundles outputted by this
                 operator.
-            ray_remote_args: Args to provide to ray.remote.
+            ray_remote_args: Args to provide to :func:`ray.remote`.
         """
-        super().__init__(name, [input_op])
+        super().__init__(name, [input_op], num_outputs)
         self._num_outputs = num_outputs
         self._ray_remote_args = ray_remote_args or {}
+        self._sub_progress_bar_names = sub_progress_bar_names
 
 
 class RandomizeBlocks(AbstractAllToAll):
@@ -40,10 +46,14 @@ class RandomizeBlocks(AbstractAllToAll):
         seed: Optional[int] = None,
     ):
         super().__init__(
-            "RandomizeBlocks",
+            "RandomizeBlockOrder",
             input_op,
         )
         self._seed = seed
+
+    def aggregate_output_metadata(self) -> BlockMetadata:
+        assert len(self._input_dependencies) == 1, len(self._input_dependencies)
+        return self._input_dependencies[0].aggregate_output_metadata()
 
 
 class RandomShuffle(AbstractAllToAll):
@@ -54,16 +64,22 @@ class RandomShuffle(AbstractAllToAll):
         input_op: LogicalOperator,
         name: str = "RandomShuffle",
         seed: Optional[int] = None,
-        num_outputs: Optional[int] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             name,
             input_op,
-            num_outputs=num_outputs,
+            sub_progress_bar_names=[
+                ExchangeTaskSpec.MAP_SUB_PROGRESS_BAR_NAME,
+                ExchangeTaskSpec.REDUCE_SUB_PROGRESS_BAR_NAME,
+            ],
             ray_remote_args=ray_remote_args,
         )
         self._seed = seed
+
+    def aggregate_output_metadata(self) -> BlockMetadata:
+        assert len(self._input_dependencies) == 1, len(self._input_dependencies)
+        return self._input_dependencies[0].aggregate_output_metadata()
 
 
 class Repartition(AbstractAllToAll):
@@ -75,12 +91,26 @@ class Repartition(AbstractAllToAll):
         num_outputs: int,
         shuffle: bool,
     ):
+        if shuffle:
+            sub_progress_bar_names = [
+                ExchangeTaskSpec.MAP_SUB_PROGRESS_BAR_NAME,
+                ExchangeTaskSpec.REDUCE_SUB_PROGRESS_BAR_NAME,
+            ]
+        else:
+            sub_progress_bar_names = [
+                ShuffleTaskSpec.SPLIT_REPARTITION_SUB_PROGRESS_BAR_NAME,
+            ]
         super().__init__(
             "Repartition",
             input_op,
             num_outputs=num_outputs,
+            sub_progress_bar_names=sub_progress_bar_names,
         )
         self._shuffle = shuffle
+
+    def aggregate_output_metadata(self) -> BlockMetadata:
+        assert len(self._input_dependencies) == 1, len(self._input_dependencies)
+        return self._input_dependencies[0].aggregate_output_metadata()
 
 
 class Sort(AbstractAllToAll):
@@ -89,15 +119,24 @@ class Sort(AbstractAllToAll):
     def __init__(
         self,
         input_op: LogicalOperator,
-        key: Optional[str],
-        descending: bool,
+        sort_key: SortKey,
+        batch_format: Optional[str] = "default",
     ):
         super().__init__(
             "Sort",
             input_op,
+            sub_progress_bar_names=[
+                SortTaskSpec.SORT_SAMPLE_SUB_PROGRESS_BAR_NAME,
+                ExchangeTaskSpec.MAP_SUB_PROGRESS_BAR_NAME,
+                ExchangeTaskSpec.REDUCE_SUB_PROGRESS_BAR_NAME,
+            ],
         )
-        self._key = key
-        self._descending = descending
+        self._sort_key = sort_key
+        self._batch_format = batch_format
+
+    def aggregate_output_metadata(self) -> BlockMetadata:
+        assert len(self._input_dependencies) == 1, len(self._input_dependencies)
+        return self._input_dependencies[0].aggregate_output_metadata()
 
 
 class Aggregate(AbstractAllToAll):
@@ -108,10 +147,17 @@ class Aggregate(AbstractAllToAll):
         input_op: LogicalOperator,
         key: Optional[str],
         aggs: List[AggregateFn],
+        batch_format: Optional[str] = "default",
     ):
         super().__init__(
             "Aggregate",
             input_op,
+            sub_progress_bar_names=[
+                SortTaskSpec.SORT_SAMPLE_SUB_PROGRESS_BAR_NAME,
+                ExchangeTaskSpec.MAP_SUB_PROGRESS_BAR_NAME,
+                ExchangeTaskSpec.REDUCE_SUB_PROGRESS_BAR_NAME,
+            ],
         )
         self._key = key
         self._aggs = aggs
+        self._batch_format = batch_format

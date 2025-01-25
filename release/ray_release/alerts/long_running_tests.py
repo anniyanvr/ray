@@ -1,6 +1,6 @@
 from typing import Optional
 
-from ray_release.config import Test
+from ray_release.test import Test
 from ray_release.result import Result
 
 
@@ -27,7 +27,6 @@ def handle_result(
         "long_running_apex",
         "long_running_impala",
         "long_running_many_ppo",
-        "long_running_pbt",
     ]:
         # Tune/RLlib style tests
         target_update_diff = 480
