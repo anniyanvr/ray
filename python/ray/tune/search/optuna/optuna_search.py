@@ -1,12 +1,20 @@
-import time
+import functools
 import logging
 import pickle
-import functools
+import time
 import warnings
-from packaging import version
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from ray.tune.result import DEFAULT_METRIC, TRAINING_ITERATION
+from packaging import version
+
+from ray.air.constants import TRAINING_ITERATION
+from ray.tune.result import DEFAULT_METRIC
+from ray.tune.search import (
+    UNDEFINED_METRIC_MODE,
+    UNDEFINED_SEARCH_SPACE,
+    UNRESOLVED_SEARCH_SPACE,
+    Searcher,
+)
 from ray.tune.search.sample import (
     Categorical,
     Domain,
@@ -16,12 +24,6 @@ from ray.tune.search.sample import (
     Quantized,
     Uniform,
 )
-from ray.tune.search import (
-    UNRESOLVED_SEARCH_SPACE,
-    UNDEFINED_METRIC_MODE,
-    UNDEFINED_SEARCH_SPACE,
-    Searcher,
-)
 from ray.tune.search.variant_generator import parse_spec_vars
 from ray.tune.utils.util import flatten_dict, unflatten_dict, validate_warmstart
 
@@ -29,12 +31,14 @@ try:
     import optuna as ot
     from optuna.distributions import BaseDistribution as OptunaDistribution
     from optuna.samplers import BaseSampler
-    from optuna.trial import TrialState as OptunaTrialState
+    from optuna.storages import BaseStorage
     from optuna.trial import Trial as OptunaTrial
+    from optuna.trial import TrialState as OptunaTrialState
 except ImportError:
     ot = None
     OptunaDistribution = None
     BaseSampler = None
+    BaseStorage = None
     OptunaTrialState = None
     OptunaTrial = None
 
@@ -131,7 +135,11 @@ class OptunaSearch(Searcher):
                 a delay when suggesting new configurations.
                 This is an Optuna issue and may be fixed in a future
                 Optuna release.
-
+        study_name: Optuna study name that uniquely identifies the trial
+            results. Defaults to ``"optuna"``.
+        storage: Optuna storage used for storing trial results to
+            storages other than in-memory storage,
+            for instance optuna.storages.RDBStorage.
         seed: Seed to initialize sampler with. This parameter is only
             used when ``sampler=None``. In all other cases, the sampler
             you pass should be initialized with the seed already.
@@ -182,8 +190,8 @@ class OptunaSearch(Searcher):
         import optuna
 
         space = {
-            "a": optuna.distributions.UniformDistribution(6, 8),
-            "b": optuna.distributions.LogUniformDistribution(1e-4, 1e-2),
+            "a": optuna.distributions.FloatDistribution(6, 8),
+            "b": optuna.distributions.FloatDistribution(1e-4, 1e-2, log=True),
         }
 
         optuna_search = OptunaSearch(
@@ -228,8 +236,8 @@ class OptunaSearch(Searcher):
         import optuna
 
         space = {
-            "a": optuna.distributions.UniformDistribution(6, 8),
-            "b": optuna.distributions.LogUniformDistribution(1e-4, 1e-2),
+            "a": optuna.distributions.FloatDistribution(6, 8),
+            "b": optuna.distributions.FloatDistribution(1e-4, 1e-2, log=True),
         }
 
         # Note you have to specify metric and mode here instead of
@@ -257,8 +265,8 @@ class OptunaSearch(Searcher):
         import optuna
 
         space = {
-            "a": optuna.distributions.UniformDistribution(6, 8),
-            "b": optuna.distributions.LogUniformDistribution(1e-4, 1e-2),
+            "a": optuna.distributions.FloatDistribution(6, 8),
+            "b": optuna.distributions.FloatDistribution(1e-4, 1e-2, log=True),
         }
 
         optuna_search = OptunaSearch(
@@ -284,8 +292,8 @@ class OptunaSearch(Searcher):
         import optuna
 
         space = {
-            "a": optuna.distributions.UniformDistribution(6, 8),
-            "b": optuna.distributions.LogUniformDistribution(1e-4, 1e-2),
+            "a": optuna.distributions.FloatDistribution(6, 8),
+            "b": optuna.distributions.FloatDistribution(1e-4, 1e-2, log=True),
         }
 
         optuna_search = OptunaSearch(
@@ -320,6 +328,8 @@ class OptunaSearch(Searcher):
         mode: Optional[Union[str, List[str]]] = None,
         points_to_evaluate: Optional[List[Dict]] = None,
         sampler: Optional["BaseSampler"] = None,
+        study_name: Optional[str] = None,
+        storage: Optional["BaseStorage"] = None,
         seed: Optional[int] = None,
         evaluated_rewards: Optional[List] = None,
     ):
@@ -341,8 +351,10 @@ class OptunaSearch(Searcher):
 
         self._points_to_evaluate = points_to_evaluate or []
         self._evaluated_rewards = evaluated_rewards
-
-        self._study_name = "optuna"  # Fixed study name for in-memory storage
+        if study_name:
+            self._study_name = study_name
+        else:
+            self._study_name = "optuna"  # Fixed study name for in-memory storage
 
         if sampler and seed:
             logger.warning(
@@ -359,6 +371,15 @@ class OptunaSearch(Searcher):
 
         self._sampler = sampler
         self._seed = seed
+
+        if storage:
+            assert isinstance(storage, BaseStorage), (
+                "The `storage` parameter in `OptunaSearcher` must be an instance "
+                "of `optuna.storages.BaseStorage`."
+            )
+        # If storage is not provided, just set self._storage to None
+        # so that the default in-memory storage is used.
+        self._storage = storage
 
         self._completed_trials = set()
 
@@ -378,7 +399,6 @@ class OptunaSearch(Searcher):
             self._metric = DEFAULT_METRIC
 
         pruner = ot.pruners.NopPruner()
-        storage = ot.storages.InMemoryStorage()
 
         if self._sampler:
             sampler = self._sampler
@@ -400,7 +420,7 @@ class OptunaSearch(Searcher):
             )
 
         self._ot_study = ot.study.create_study(
-            storage=storage,
+            storage=self._storage,
             sampler=sampler,
             pruner=pruner,
             study_name=self._study_name,
@@ -587,11 +607,18 @@ class OptunaSearch(Searcher):
             ot_trial_state = OptunaTrialState.PRUNED
 
         if intermediate_values:
-            intermediate_values_dict = {
-                i: value for i, value in enumerate(intermediate_values)
-            }
+            intermediate_values_dict = dict(enumerate(intermediate_values))
         else:
             intermediate_values_dict = None
+
+        # If the trial state is FAILED, the value must be `None` in Optuna==4.1.0
+        # Reference: https://github.com/optuna/optuna/pull/5211
+        # This is a temporary fix for the issue that Optuna enforces the value
+        # to be `None` if the trial state is FAILED.
+        # TODO (hpguo): A better solution may requires us to update the base class
+        # to allow the `value` arg in `add_evaluated_point` being `Optional[float]`.
+        if ot_trial_state == OptunaTrialState.FAIL:
+            value = None
 
         trial = ot.trial.create_trial(
             state=ot_trial_state,
@@ -661,28 +688,28 @@ class OptunaSearch(Searcher):
                             "Optuna does not support both quantization and "
                             "sampling from LogUniform. Dropped quantization."
                         )
-                    return ot.distributions.LogUniformDistribution(
-                        domain.lower, domain.upper
+                    return ot.distributions.FloatDistribution(
+                        domain.lower, domain.upper, log=True
                     )
 
                 elif isinstance(sampler, Uniform):
                     if quantize:
-                        return ot.distributions.DiscreteUniformDistribution(
-                            domain.lower, domain.upper, quantize
+                        return ot.distributions.FloatDistribution(
+                            domain.lower, domain.upper, step=quantize
                         )
-                    return ot.distributions.UniformDistribution(
+                    return ot.distributions.FloatDistribution(
                         domain.lower, domain.upper
                     )
 
             elif isinstance(domain, Integer):
                 if isinstance(sampler, LogUniform):
-                    return ot.distributions.IntLogUniformDistribution(
-                        domain.lower, domain.upper - 1, step=quantize or 1
+                    return ot.distributions.IntDistribution(
+                        domain.lower, domain.upper - 1, step=quantize or 1, log=True
                     )
                 elif isinstance(sampler, Uniform):
                     # Upper bound should be inclusive for quantization and
                     # exclusive otherwise
-                    return ot.distributions.IntUniformDistribution(
+                    return ot.distributions.IntDistribution(
                         domain.lower,
                         domain.upper - int(bool(not quantize)),
                         step=quantize or 1,

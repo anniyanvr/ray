@@ -29,8 +29,13 @@
 
 namespace ray {
 
-typedef boost::asio::generic::stream_protocol local_stream_protocol;
-typedef boost::asio::basic_stream_socket<local_stream_protocol> local_stream_socket;
+using local_stream_protocol = boost::asio::generic::stream_protocol;
+using local_stream_socket = boost::asio::basic_stream_socket<local_stream_protocol>;
+
+// Set "close on exec" feature for the given file descriptor.
+// WARNIGN: It does no-op on windows platform.
+void SetCloseOnExec(local_stream_socket &socket);
+void SetCloseOnExec(boost::asio::basic_socket_acceptor<local_stream_protocol> &acceptor);
 
 /// Connect to a socket with retry times.
 Status ConnectSocketRetry(local_stream_socket &socket,
@@ -44,6 +49,9 @@ Status ConnectSocketRetry(local_stream_socket &socket,
 /// can be used to write messages synchronously to the server.
 class ServerConnection : public std::enable_shared_from_this<ServerConnection> {
  public:
+  ServerConnection(const ServerConnection &) = delete;
+  ServerConnection &operator=(const ServerConnection &) = delete;
+
   /// ServerConnection destructor.
   virtual ~ServerConnection();
 
@@ -187,6 +195,9 @@ class ClientConnection : public ServerConnection {
  public:
   using std::enable_shared_from_this<ServerConnection>::shared_from_this;
 
+  ClientConnection(const ClientConnection &) = delete;
+  ClientConnection &operator=(const ClientConnection &) = delete;
+
   /// Allocate a new node client connection.
   ///
   /// \param new_client_handler A reference to the client handler.
@@ -217,6 +228,8 @@ class ClientConnection : public ServerConnection {
   /// message has been fully received, the client manager's
   /// ProcessClientMessage handler will be called.
   void ProcessMessages();
+
+  const std::string GetDebugLabel() const { return debug_label_; }
 
  protected:
   /// A protected constructor for a node client connection.

@@ -1,10 +1,9 @@
-from typing import Tuple, Callable, Any, Union
 from types import ModuleType
+from typing import Any, Callable, Tuple, Union
 
 import numpy as np
 
-from ray.data.block import T, U, Block, KeyType, AggType
-
+from ray.data.block import AggType, Block, KeyType, T, U
 
 WrappedAggType = Tuple[AggType, int]
 
@@ -190,7 +189,7 @@ def _null_wrap_accumulate_row(
 
 def _null_wrap_accumulate_block(
     ignore_nulls: bool,
-    accum_block: Callable[[AggType, Block], AggType],
+    accum_block: Callable[[Block], AggType],
     null_merge: Callable[[WrappedAggType, WrappedAggType], WrappedAggType],
 ) -> Callable[[WrappedAggType, Block], WrappedAggType]:
     """

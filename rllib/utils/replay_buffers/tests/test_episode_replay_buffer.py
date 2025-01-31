@@ -1,28 +1,29 @@
 import unittest
 
 import numpy as np
-
+from ray.rllib.env.single_agent_episode import SingleAgentEpisode
 from ray.rllib.utils.replay_buffers.episode_replay_buffer import (
-    _Episode,
     EpisodeReplayBuffer,
 )
+
+from ray.rllib.utils.test_utils import check
 
 
 class TestEpisodeReplayBuffer(unittest.TestCase):
     @staticmethod
-    def _get_episode_sample_batch(episode_len=None, id_=None):
-        eps = _Episode(id_=id_, observations=[0.0])
+    def _get_episode(episode_len=None, id_=None):
+        eps = SingleAgentEpisode(id_=id_, observations=[0.0], infos=[{}])
         ts = np.random.randint(1, 200) if episode_len is None else episode_len
         for t in range(ts):
-            eps.add_timestep(
+            eps.add_env_step(
                 observation=float(t + 1),
                 action=int(t),
                 reward=0.1 * (t + 1),
+                infos={},
             )
         eps.is_terminated = np.random.random() > 0.5
         eps.is_truncated = False if eps.is_terminated else np.random.random() > 0.8
-        sample_batch = eps.to_sample_batch()
-        return sample_batch
+        return eps
 
     def test_add_and_eviction_logic(self):
         """Tests batches getting properly added to buffer and cause proper eviction."""
@@ -30,54 +31,54 @@ class TestEpisodeReplayBuffer(unittest.TestCase):
         # Fill a buffer till capacity (100 ts).
         buffer = EpisodeReplayBuffer(capacity=100)
 
-        batch = self._get_episode_sample_batch(id_="A", episode_len=50)
-        buffer.add(batch)
+        episode = self._get_episode(id_="A", episode_len=50)
+        buffer.add(episode)
         self.assertTrue(buffer.get_num_episodes() == 1)
         self.assertTrue(buffer.get_num_timesteps() == 50)
 
-        batch = self._get_episode_sample_batch(id_="B", episode_len=25)
-        buffer.add(batch)
+        episode = self._get_episode(id_="B", episode_len=25)
+        buffer.add(episode)
         self.assertTrue(buffer.get_num_episodes() == 2)
         self.assertTrue(buffer.get_num_timesteps() == 75)
 
         # No eviction yet (but we are full).
-        batch = self._get_episode_sample_batch(id_="C", episode_len=25)
-        buffer.add(batch)
+        episode = self._get_episode(id_="C", episode_len=25)
+        buffer.add(episode)
         self.assertTrue(buffer.get_num_episodes() == 3)
         self.assertTrue(buffer.get_num_timesteps() == 100)
 
         # Trigger eviction of first episode by adding a single timestep episode.
-        batch = self._get_episode_sample_batch(id_="D", episode_len=1)
-        buffer.add(batch)
+        episode = self._get_episode(id_="D", episode_len=1)
+        buffer.add(episode)
 
         self.assertTrue(buffer.get_num_episodes() == 3)
         self.assertTrue(buffer.get_num_timesteps() == 51)
         self.assertTrue({eps.id_ for eps in buffer.episodes} == {"B", "C", "D"})
 
         # Add another big episode and trigger another eviction.
-        batch = self._get_episode_sample_batch(id_="E", episode_len=200)
-        buffer.add(batch)
+        episode = self._get_episode(id_="E", episode_len=200)
+        buffer.add(episode)
         self.assertTrue(buffer.get_num_episodes() == 1)
         self.assertTrue(buffer.get_num_timesteps() == 200)
         self.assertTrue({eps.id_ for eps in buffer.episodes} == {"E"})
 
         # Add another small episode and trigger another eviction.
-        batch = self._get_episode_sample_batch(id_="F", episode_len=2)
-        buffer.add(batch)
+        episode = self._get_episode(id_="F", episode_len=2)
+        buffer.add(episode)
         self.assertTrue(buffer.get_num_episodes() == 1)
         self.assertTrue(buffer.get_num_timesteps() == 2)
         self.assertTrue({eps.id_ for eps in buffer.episodes} == {"F"})
 
         # Add N small episodes.
         for i in range(10):
-            batch = self._get_episode_sample_batch(id_=str(i), episode_len=10)
-            buffer.add(batch)
+            episode = self._get_episode(id_=str(i), episode_len=10)
+            buffer.add(episode)
         self.assertTrue(buffer.get_num_episodes() == 10)
         self.assertTrue(buffer.get_num_timesteps() == 100)
 
         # Add a 20-ts episode and expect to have evicted 3 episodes.
-        batch = self._get_episode_sample_batch(id_="G", episode_len=21)
-        buffer.add(batch)
+        episode = self._get_episode(id_="G", episode_len=21)
+        buffer.add(episode)
         self.assertTrue(buffer.get_num_episodes() == 8)
         self.assertTrue(buffer.get_num_timesteps() == 91)
         self.assertTrue(
@@ -90,8 +91,8 @@ class TestEpisodeReplayBuffer(unittest.TestCase):
         buffer = EpisodeReplayBuffer(capacity=10000)
 
         for _ in range(200):
-            batch = self._get_episode_sample_batch()
-            buffer.add(batch)
+            episode = self._get_episode()
+            buffer.add(episode)
 
         for _ in range(1000):
             sample = buffer.sample(batch_size_B=16, batch_length_T=64)
@@ -139,6 +140,53 @@ class TestEpisodeReplayBuffer(unittest.TestCase):
             # Where is_terminated, the next rewards should always be 0.0
             # (reset rewards).
             assert np.all(np.where(is_terminated[:, :-1], rewards[:, 1:] == 0.0, True))
+
+    def test_episode_replay_buffer_episode_sample_logic(self):
+
+        buffer = EpisodeReplayBuffer(capacity=10000)
+
+        for _ in range(200):
+            episode = self._get_episode()
+            buffer.add(episode)
+
+        for i in range(1000):
+            sample = buffer.sample(batch_size_B=16, n_step=1, sample_episodes=True)
+            check(buffer.get_sampled_timesteps(), 16 * (i + 1))
+            for eps in sample:
+
+                (
+                    obs,
+                    action,
+                    reward,
+                    next_obs,
+                    is_terminated,
+                    is_truncated,
+                    n_step,
+                ) = (
+                    eps.get_observations(0),
+                    eps.get_actions(-1),
+                    eps.get_rewards(-1),
+                    eps.get_observations(-1),
+                    eps.is_terminated,
+                    eps.is_truncated,
+                    eps.get_extra_model_outputs("n_step", -1),
+                )
+
+                # Make sure terminated and truncated are never both True.
+                assert not (is_truncated and is_terminated)
+
+                # Note, floating point numbers cannot be compared directly.
+                tolerance = 1e-8
+                # Assert that actions correspond to the observations.
+                check(obs, action, atol=tolerance)
+                # Assert that next observations are correctly one step after
+                # observations.
+                check(next_obs, obs + 1, atol=tolerance)
+                # Assert that the reward comes from the next observation.
+                check(reward * 10, next_obs, atol=tolerance)
+
+                # Assert that all n-steps are 1.0 as passed into `sample`.
+                check(n_step, 1.0, atol=tolerance)
 
 
 if __name__ == "__main__":

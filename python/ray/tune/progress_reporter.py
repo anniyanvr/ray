@@ -3,12 +3,11 @@ from __future__ import print_function
 import collections
 import datetime
 import numbers
-
-import os
 import sys
 import textwrap
 import time
 import warnings
+from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -17,9 +16,11 @@ import pandas as pd
 import ray
 from ray._private.dict import flatten_dict
 from ray._private.thirdparty.tabulate.tabulate import tabulate
-from ray.experimental.tqdm_ray import safe_print
+from ray.air.constants import EXPR_ERROR_FILE, TRAINING_ITERATION
 from ray.air.util.node import _force_on_current_node
+from ray.experimental.tqdm_ray import safe_print
 from ray.tune.callback import Callback
+from ray.tune.experiment.trial import DEBUG_PRINT_INTERVAL, Trial, _Location
 from ray.tune.logger import pretty_print
 from ray.tune.result import (
     AUTO_RESULT_KEYS,
@@ -33,16 +34,13 @@ from ray.tune.result import (
     PID,
     TIME_TOTAL_S,
     TIMESTEPS_TOTAL,
-    TRAINING_ITERATION,
     TRIAL_ID,
 )
-from ray.tune.experiment.trial import DEBUG_PRINT_INTERVAL, Trial, _Location
 from ray.tune.trainable import Trainable
 from ray.tune.utils import unflattened_lookup
 from ray.tune.utils.log import Verbosity, has_verbosity, set_verbosity
 from ray.util.annotations import DeveloperAPI, PublicAPI
 from ray.util.queue import Empty, Queue
-
 from ray.widgets import Template
 
 try:
@@ -532,7 +530,7 @@ class JupyterNotebookReporter(TuneReporterBase, RemoteReporterMixin):
                 "If this leads to unformatted output (e.g. like "
                 "<IPython.core.display.HTML object>), consider passing "
                 "a `CLIReporter` as the `progress_reporter` argument "
-                "to `air.RunConfig()` instead."
+                "to `train.RunConfig()` instead."
             )
 
         self._overwrite = overwrite
@@ -1145,14 +1143,29 @@ def _trial_errors_str(
                     max_rows, num_failed - max_rows
                 )
             )
-        error_table = []
-        for trial in failed[:max_rows]:
-            row = [str(trial), trial.num_failures, trial.error_file]
-            error_table.append(row)
-        columns = ["Trial name", "# failures", "error file"]
+
+        fail_header = ["Trial name", "# failures", "error file"]
+        fail_table_data = [
+            [
+                str(trial),
+                str(trial.run_metadata.num_failures)
+                + ("" if trial.status == Trial.ERROR else "*"),
+                trial.error_file,
+            ]
+            for trial in failed[:max_rows]
+        ]
         messages.append(
-            tabulate(error_table, headers=columns, tablefmt=fmt, showindex=False)
+            tabulate(
+                fail_table_data,
+                headers=fail_header,
+                tablefmt=fmt,
+                showindex=False,
+                colalign=("left", "right", "left"),
+            )
         )
+        if any(trial.status == Trial.TERMINATED for trial in failed[:max_rows]):
+            messages.append("* The trial terminated successfully after retrying.")
+
     delim = "<br>" if fmt == "html" else "\n"
     return delim.join(messages)
 
@@ -1224,7 +1237,7 @@ def _get_trial_location(trial: Trial, result: dict) -> _Location:
         location = _Location(node_ip, pid)
     else:
         # fallback to trial location if there hasn't been a report yet
-        location = trial.location
+        location = trial.temporary_state.location
     return location
 
 
@@ -1373,7 +1386,7 @@ class TrialProgressCallback(Callback):
         elif has_verbosity(Verbosity.V2_TRIAL_NORM):
             metric_name = self._metric or "_metric"
             metric_value = result.get(metric_name, -99.0)
-            error_file = os.path.join(trial.local_path, "error.txt")
+            error_file = Path(trial.local_path, EXPR_ERROR_FILE).as_posix()
 
             info = ""
             if done:
@@ -1446,7 +1459,7 @@ class TrialProgressCallback(Callback):
             error: True if an error has occurred, False otherwise
             done: True if the trial is finished, False otherwise
         """
-        from IPython.display import display, HTML
+        from IPython.display import HTML, display
 
         self._last_result[trial] = result
         if has_verbosity(Verbosity.V3_TRIAL_DETAILS):
@@ -1499,7 +1512,7 @@ class TrialProgressCallback(Callback):
         return print_result_str
 
 
-def _detect_reporter(**kwargs) -> TuneReporterBase:
+def _detect_reporter(_trainer_api: bool = False, **kwargs) -> TuneReporterBase:
     """Detect progress reporter class.
 
     Will return a :class:`JupyterNotebookReporter` if a IPython/Jupyter-like
@@ -1507,7 +1520,7 @@ def _detect_reporter(**kwargs) -> TuneReporterBase:
 
     Keyword arguments are passed on to the reporter class.
     """
-    if IS_NOTEBOOK:
+    if IS_NOTEBOOK and not _trainer_api:
         kwargs.setdefault("overwrite", not has_verbosity(Verbosity.V2_TRIAL_NORM))
         progress_reporter = JupyterNotebookReporter(**kwargs)
     else:

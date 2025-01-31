@@ -21,8 +21,7 @@ import pytest
 import pandas
 import numpy as np
 from numpy.testing import assert_array_equal
-import ray
-from ray.tests.conftest import start_cluster  # noqa F401
+from ray.tests.conftest import ray_start_regular_shared  # noqa F401
 
 modin_installed = True
 
@@ -33,7 +32,7 @@ except ModuleNotFoundError:
 
 skip = not modin_installed
 
-# These tests are written for versions of Modin that require python 3.7+
+# These tests are written for versions of Modin that require python 3.8+
 pytestmark = pytest.mark.skipif(skip, reason="Outdated or missing Modin dependency")
 
 if not skip:
@@ -41,11 +40,8 @@ if not skip:
     import modin.pandas as pd
 
 
-# Module scoped fixture. Will first run all tests without ray
-# client, then rerun all tests with a single ray client session.
 @pytest.fixture(autouse=True)
-def run_ray_client(start_cluster):  # noqa F811
-    ray.init(start_cluster[1])
+def connect_to_ray_cluster(ray_start_regular_shared):  # noqa F811
     yield
 
 

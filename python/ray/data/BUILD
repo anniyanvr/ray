@@ -1,3 +1,10 @@
+load("//bazel:python.bzl", "doctest")
+
+doctest(
+    files = glob(["**/*.py"], exclude=glob(["examples/**/*", "tests/**/*"])),
+    tags = ["team:data"],
+    size = "large"
+)
 # --------------------------------------------------------------------
 # Tests from the python/ray/data/tests directory.
 # Covers all tests starting with `test_`.
@@ -14,7 +21,7 @@ py_library(
 py_test_module_list(
     files = glob(["tests/block_batching/test_*.py"]),
     size = "medium",
-    tags = ["team:ml", "exclusive"],
+    tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
 
@@ -51,14 +58,6 @@ py_test(
 )
 
 py_test(
-    name = "test_nonstrict_mode",
-    size = "small",
-    srcs = ["tests/test_nonstrict_mode.py"],
-    tags = ["team:data", "exclusive"],
-    deps = ["//:ray_lib", ":conftest"],
-)
-
-py_test(
     name = "test_sql",
     size = "small",
     srcs = ["tests/test_sql.py"],
@@ -70,6 +69,14 @@ py_test(
     name = "test_mongo",
     size = "large",
     srcs = ["tests/test_mongo.py"],
+    tags = ["team:data", "exclusive", "data_integration"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_bigquery",
+    size = "large",
+    srcs = ["tests/test_bigquery.py"],
     tags = ["team:data", "exclusive", "data_integration"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -91,8 +98,16 @@ py_test(
 )
 
 py_test(
+    name = "test_arrow_block",
+    size = "medium",
+    srcs = ["tests/test_arrow_block.py"],
+    tags = ["team:data", "exclusive", "data_non_parallel"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
     name = "test_auto_parallelism",
-    size = "small",
+    size = "medium",
     srcs = ["tests/test_auto_parallelism.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
@@ -115,9 +130,9 @@ py_test(
 )
 
 py_test(
-    name = "test_bulk_executor",
-    size = "small",
-    srcs = ["tests/test_bulk_executor.py"],
+    name = "test_block_sizing",
+    size = "medium",
+    srcs = ["tests/test_block_sizing.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -126,6 +141,22 @@ py_test(
     name = "test_context_propagation",
     size = "small",
     srcs = ["tests/test_context_propagation.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_audio",
+    size = "small",
+    srcs = ["tests/test_audio.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_avro",
+    size = "small",
+    srcs = ["tests/test_avro.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -163,9 +194,49 @@ py_test(
 )
 
 py_test(
+    name = "test_datasink",
+    size = "small",
+    srcs = ["tests/test_datasink.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
     name = "test_ecosystem",
     size = "small",
     srcs = ["tests/test_ecosystem.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_file_based_datasource",
+    size = "small",
+    srcs = ["tests/test_file_based_datasource.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_file_datasink",
+    size = "small",
+    srcs = ["tests/test_file_datasink.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_filename_provider",
+    size = "small",
+    srcs = ["tests/test_filename_provider.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_hudi",
+    size = "small",
+    srcs = ["tests/test_hudi.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -195,9 +266,9 @@ py_test(
 )
 
 py_test(
-    name = "test_logger",
+    name = "test_logging",
     size = "small",
-    srcs = ["tests/test_logger.py"],
+    srcs = ["tests/test_logging.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -212,7 +283,7 @@ py_test(
 
 py_test(
     name = "test_numpy",
-    size = "small",
+    size = "medium",
     srcs = ["tests/test_numpy.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
@@ -227,17 +298,17 @@ py_test(
 )
 
 py_test(
-    name = "test_parquet",
-    size = "medium",
-    srcs = ["tests/test_parquet.py"],
+    name = "test_pandas_block",
+    size = "small",
+    srcs = ["tests/test_pandas_block.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
 
 py_test(
-    name = "test_pipeline",
+    name = "test_parquet",
     size = "medium",
-    srcs = ["tests/test_pipeline.py"],
+    srcs = ["tests/test_parquet.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -270,7 +341,7 @@ py_test(
     name = "test_tfrecords",
     size = "small",
     srcs = ["tests/test_tfrecords.py"],
-    tags = ["team:data", "exclusive"],
+    tags = ["team:data", "exclusive", "tfxbsl"],
     deps = ["//:ray_lib", ":conftest"],
 )
 
@@ -282,13 +353,32 @@ py_test(
     deps = ["//:ray_lib", ":conftest"],
 )
 
+# Added "data_non_parallel" tag to prevent parallel execution of this test.
+# It needs about 5GB memory.
 py_test(
     name = "test_dynamic_block_split",
     size = "medium",
     srcs = ["tests/test_dynamic_block_split.py"],
+    tags = ["team:data", "exclusive", "data_non_parallel"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_splitblocks",
+    size = "medium",
+    srcs = ["tests/test_splitblocks.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
+
+py_test(
+    name = "test_exceptions",
+    size = "small",
+    srcs = ["tests/test_exceptions.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
 
 py_test(
     name = "test_execution_optimizer",
@@ -308,8 +398,16 @@ py_test(
 
 py_test(
     name = "test_huggingface",
-    size = "small",
+    size = "medium",
     srcs = ["tests/test_huggingface.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_iceberg",
+    size = "medium",
+    srcs = ["tests/test_iceberg.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -364,17 +462,9 @@ py_test(
 )
 
 py_test(
-    name = "test_pipeline_incremental_take",
+    name = "test_progress_bar",
     size = "small",
-    srcs = ["tests/test_pipeline_incremental_take.py"],
-    tags = ["team:data", "exclusive"],
-    deps = ["//:ray_lib", ":conftest"],
-)
-
-py_test(
-    name = "test_pipeline_nohang",
-    size = "medium",
-    srcs = ["tests/test_pipeline_nohang.py"],
+    srcs = ["tests/test_progress_bar.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -421,7 +511,7 @@ py_test(
 
 py_test(
     name = "test_split",
-    size = "medium",
+    size = "large",
     srcs = ["tests/test_split.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
@@ -429,7 +519,7 @@ py_test(
 
 py_test(
     name = "test_stats",
-    size = "small",
+    size = "medium",
     srcs = ["tests/test_stats.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
@@ -437,8 +527,24 @@ py_test(
 
 py_test(
     name = "test_streaming_executor",
-    size = "small",
+    size = "medium",
     srcs = ["tests/test_streaming_executor.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_resource_manager",
+    size = "medium",
+    srcs = ["tests/test_resource_manager.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_streaming_executor_errored_blocks",
+    size = "medium",
+    srcs = ["tests/test_streaming_executor_errored_blocks.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -447,14 +553,6 @@ py_test(
     name = "test_streaming_integration",
     size = "medium",
     srcs = ["tests/test_streaming_integration.py"],
-    tags = ["team:data", "exclusive"],
-    deps = ["//:ray_lib", ":conftest"],
-)
-
-py_test(
-    name = "test_streaming_backpressure_edge_case",
-    size = "medium",
-    srcs = ["tests/test_streaming_backpressure_edge_case.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )
@@ -476,9 +574,113 @@ py_test(
 )
 
 py_test(
+    name = "test_video",
+    size = "small",
+    srcs = ["tests/test_video.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
     name = "test_webdataset",
     size = "medium",
     srcs = ["tests/test_webdataset.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_zip",
+    size = "small",
+    srcs = ["tests/test_zip.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_backpressure_policies",
+    size = "medium",
+    srcs = ["tests/test_backpressure_policies.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_backpressure_e2e",
+    size = "large",
+    srcs = ["tests/test_backpressure_e2e.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_bundle_queue",
+    size = "small",
+    srcs = ["tests/test_bundle_queue.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_autoscaler",
+    size = "small",
+    srcs = ["tests/test_autoscaler.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_clickhouse",
+    size = "small",
+    srcs = ["tests/test_clickhouse.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_lance",
+    size = "small",
+    srcs = ["tests/test_lance.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_logical_plan",
+    size = "small",
+    srcs = ["tests/test_logical_plan.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_delta_sharing",
+    size = "small",
+    srcs = ["tests/test_delta_sharing.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_context",
+    size = "small",
+    srcs = ["tests/test_context.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_expression_evaluator",
+    size = "small",
+    srcs = ["tests/test_expression_evaluator.py"],
+    tags = ["team:data", "exclusive"],
+    deps = ["//:ray_lib", ":conftest"],
+)
+
+py_test(
+    name = "test_block_boundaries",
+    size = "small",
+    srcs = ["tests/test_block_boundaries.py"],
     tags = ["team:data", "exclusive"],
     deps = ["//:ray_lib", ":conftest"],
 )

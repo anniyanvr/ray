@@ -17,17 +17,17 @@ from ray.rllib.connectors.agent.mean_std_filter import (
     MeanStdObservationFilterAgentConnector,
     ConcurrentMeanStdObservationFilterAgentConnector,
 )
-from ray.rllib.utils.typing import TrainerConfigDict
-from ray.util.annotations import PublicAPI, DeveloperAPI
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.connectors.agent.synced_filter import SyncedFilterAgentConnector
 
 if TYPE_CHECKING:
+    from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
     from ray.rllib.policy.policy import Policy
 
 logger = logging.getLogger(__name__)
 
 
-def __preprocessing_enabled(config: TrainerConfigDict):
+def __preprocessing_enabled(config: "AlgorithmConfig"):
     if config._disable_preprocessor_api:
         return False
     # Same conditions as in RolloutWorker.__init__.
@@ -38,23 +38,23 @@ def __preprocessing_enabled(config: TrainerConfigDict):
     return True
 
 
-def __clip_rewards(config: TrainerConfigDict):
+def __clip_rewards(config: "AlgorithmConfig"):
     # Same logic as in RolloutWorker.__init__.
     # We always clip rewards for Atari games.
     return config.clip_rewards or config.is_atari
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 def get_agent_connectors_from_config(
     ctx: ConnectorContext,
-    config: TrainerConfigDict,
+    config: "AlgorithmConfig",
 ) -> AgentConnectorPipeline:
     connectors = []
 
     clip_rewards = __clip_rewards(config)
     if clip_rewards is True:
         connectors.append(ClipRewardAgentConnector(ctx, sign=True))
-    elif type(clip_rewards) == float:
+    elif type(clip_rewards) is float:
         connectors.append(ClipRewardAgentConnector(ctx, limit=abs(clip_rewards)))
 
     if __preprocessing_enabled(config):
@@ -78,16 +78,16 @@ def get_agent_connectors_from_config(
     return AgentConnectorPipeline(ctx, connectors)
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 def get_action_connectors_from_config(
     ctx: ConnectorContext,
-    config: TrainerConfigDict,
+    config: "AlgorithmConfig",
 ) -> ActionConnectorPipeline:
     """Default list of action connectors to use for a new policy.
 
     Args:
         ctx: context used to create connectors.
-        config: trainer config.
+        config: The AlgorithmConfig object.
     """
     connectors = [ConvertToNumpyConnector(ctx)]
     if config.get("normalize_actions", False):
@@ -98,13 +98,13 @@ def get_action_connectors_from_config(
     return ActionConnectorPipeline(ctx, connectors)
 
 
-@PublicAPI(stability="alpha")
-def create_connectors_for_policy(policy: "Policy", config: TrainerConfigDict):
+@OldAPIStack
+def create_connectors_for_policy(policy: "Policy", config: "AlgorithmConfig"):
     """Util to create agent and action connectors for a Policy.
 
     Args:
         policy: Policy instance.
-        config: Trainer config dict.
+        config: Algorithm config dict.
     """
     ctx: ConnectorContext = ConnectorContext.from_policy(policy)
 
@@ -120,7 +120,7 @@ def create_connectors_for_policy(policy: "Policy", config: TrainerConfigDict):
     logger.info(policy.action_connectors.__str__(indentation=4))
 
 
-@PublicAPI(stability="alpha")
+@OldAPIStack
 def restore_connectors_for_policy(
     policy: "Policy", connector_config: Tuple[str, Tuple[Any]]
 ) -> Connector:
@@ -136,7 +136,7 @@ def restore_connectors_for_policy(
 
 
 # We need this filter selection mechanism temporarily to remain compatible to old API
-@DeveloperAPI
+@OldAPIStack
 def get_synced_filter_connector(ctx: ConnectorContext):
     filter_specifier = ctx.config.get("observation_filter")
     if filter_specifier == "MeanStdFilter":
@@ -149,7 +149,7 @@ def get_synced_filter_connector(ctx: ConnectorContext):
         raise Exception("Unknown observation_filter: " + str(filter_specifier))
 
 
-@DeveloperAPI
+@OldAPIStack
 def maybe_get_filters_for_syncing(rollout_worker, policy_id):
     # As long as the historic filter synchronization mechanism is in
     # place, we need to put filters into self.filters so that they get
